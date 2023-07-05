@@ -1,0 +1,157 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+
+#args = getResolvedOptions(sys.argv, ['DatabaseName']) 
+
+#Convert table names to lower case
+#args["DatabaseName"] = args["DatabaseName"].lower() 
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+s3_client = boto3.client('s3')
+
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_6_product_details_mendix/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_7_1_transactional_data", transformation_ctx = "datasource00")
+prod_details  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_2_1_product_details_mendix", transformation_ctx = "datasource0")
+prod_pos  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "al_3_3_4_mapping_new_product_positioning", transformation_ctx = "datasource2")
+#ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "al_3_3_8_mapping_missing_product_ml2", transformation_ctx = "datasource3")
+thresh_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_3_mapping_thresholds_ml2", transformation_ctx = "datasource9")
+
+thresh_ml2 = thresh_ml2.toDF().selectExpr("marketing_level_2 as ibg", "sbe as bu_scope")
+
+bw_data = bw_data.toDF()
+bw_data = bw_data.withColumnRenamed("12_month_rolling", "rolling_month_12")
+
+bw_data = bw_data.filter(bw_data.rolling_month_12 == "Yes")
+bw_data = bw_data.select('prod_number', 'ibg', 'ibg_descrp', "fiscal_year", "month")
+
+bw_data = bw_data.withColumn('prod_number', lpad(bw_data.prod_number.cast(StringType()), 18, '0'))
+
+
+bw_data = bw_data.sort(bw_data.prod_number, bw_data.fiscal_year.desc(), bw_data.month.desc())
+bw_data = bw_data.drop_duplicates(['prod_number', 'ibg'])
+bw_data = bw_data.drop('fiscal_year', 'month')
+print("2")
+
+
+
+prod_details = prod_details.toDF()
+prod_pos = prod_pos.toDF().select("prod_grp", "pg_cost", "pg_cm", "pg_cost_stats", "pg_cm_stats", "no_of_customers", "no_of_sizeable_transactions")
+
+
+#ml2 = ml2.toDF().selectExpr("produced_material as prod_grp", "ml2 as ibg")
+
+prod_details = prod_details.withColumn('prod_number', lpad(prod_details.prod_number.cast(StringType()), 18, '0'))
+
+prod_details = prod_details.drop("upload_date", "source_system")
+
+prod_details = prod_details.join(broadcast(prod_pos), "prod_grp", 'left')
+
+prod_details = prod_details.join(broadcast(bw_data), "prod_number", 'left')
+#prod_details = prod_details.join(broadcast(ml2), "prod_grp", 'left')
+
+print(prod_details.count())
+
+
+prod_details = prod_details.join(broadcast(thresh_ml2), "ibg" ,'left')
+
+print(prod_details.count())
+
+
+prod_details = prod_details.filter(prod_details.bu_scope != "Out of scope")
+
+print(prod_details.count())
+
+prod_details = prod_details.withColumn("average_vpc_kg_eur", when((prod_details.no_of_customers >= 5) & (prod_details.no_of_sizeable_transactions >= 10), prod_details.pg_cost_stats).otherwise(prod_details.pg_cost))
+prod_details = prod_details.withColumn("average_cm_kg_eur", when((prod_details.no_of_customers >= 5) & (prod_details.no_of_sizeable_transactions >= 10), prod_details.pg_cm_stats).otherwise(prod_details.pg_cm))
+
+
+#prod_details = prod_details.withColumn("average_vpc_kg_eur", when((prod_details.average_vpc_kg_eur.isNull()) | isnan(prod_details.average_vpc_kg_eur), 0.0).otherwise(prod_details.average_vpc_kg_eur))
+#prod_details = prod_details.withColumn("average_cm_kg_eur", when((prod_details.average_cm_kg_eur.isNull()) | isnan(prod_details.average_cm_kg_eur), 0.0).otherwise(prod_details.average_cm_kg_eur))
+
+prod_details = prod_details.withColumn("sales_org", prod_details.sales_org.cast(StringType()))
+
+prod_details = prod_details.withColumn('upload_date', current_timestamp())
+prod_details = prod_details.withColumn('source_system', lit("product_details_mendix"))
+
+#prod_details = prod_details.drop('ibg')
+
+prod_details = prod_details.selectExpr("prod_grp","prod_number","prod_descrp","prod_type", "unpacked_product_code", "pfam","pfam_descrp","pline","pline_descrp","bu","ibg","ibg_descrp","sales_org","volume_index", "plant_of_origin","prod_chemistry","average_vpc_kg_eur","average_cm_kg_eur","upload_date","source_system")
+
+prod_details = prod_details.drop_duplicates(["prod_grp","prod_number","prod_descrp","prod_type", "unpacked_product_code", "pfam","pfam_descrp","pline","pline_descrp","bu","ibg","ibg_descrp", "sales_org","volume_index", "plant_of_origin","prod_chemistry","average_vpc_kg_eur","average_cm_kg_eur","upload_date","source_system"])
+
+print(prod_details.count())
+
+
+prod_details_df = DynamicFrame.fromDF(prod_details, glueContext,"prod_details_df" )
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = prod_details_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_6_product_details_mendix"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+
+
+
+#3.3.8 Missing product ml2 mapping
+
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_8_mapping_missing_product_ml2/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+prod_ml2 = prod_details.selectExpr("prod_grp as produced_material", "ibg as ml2")
+
+print(prod_ml2.select('produced_material').count())
+
+prod_ml2 = prod_ml2.filter((prod_ml2.ml2.isNull()) | (isnan(prod_ml2.ml2)))
+print(prod_ml2.select('produced_material').count())
+
+prod_ml2 = prod_ml2.drop_duplicates()
+print(prod_ml2.select('produced_material').count())
+
+prod_ml2 = prod_ml2.withColumn('upload_date', current_timestamp())
+prod_ml2 = prod_ml2.withColumn('source_system', lit("product_ml2"))
+
+prod_ml2_df = DynamicFrame.fromDF(prod_ml2, glueContext,"prod_ml2_df" )
+
+datasink5 = glueContext.write_dynamic_frame.from_options(frame = prod_ml2_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_8_mapping_missing_product_ml2"}, format = "parquet", transformation_ctx = "datasink5")
+
+
+job.commit()
+
+
+
+

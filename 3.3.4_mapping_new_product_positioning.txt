@@ -1,0 +1,302 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from pyspark.sql.functions import udf
+import pyspark.sql.functions as func 
+from datetime import datetime
+
+#args = getResolvedOptions(sys.argv, ['DatabaseName']) 
+
+#Convert table names to lower case
+#args["DatabaseName"] = args["DatabaseName"].lower() 
+
+def monthToNum(shortMonth):
+    mon_dict = {
+            'jan': 1,
+            'feb': 2,
+            'mar': 3,
+            'apr': 4,
+            'may': 5,
+            'jun': 6,
+            'jul': 7,
+            'aug': 8,
+            'sep': 9, 
+            'oct': 10,
+            'nov': 11,
+            'dec': 12,
+            'January': 1,
+            'February': 2,
+            'March': 3,
+            'April': 4,
+            'May': 5,
+            'June': 6,
+            'July': 7,
+            'August': 8,
+            'September': 9, 
+            'October': 10,
+            'November': 11,
+            'December': 12,
+            'january': 1,
+            'february': 2,
+            'march': 3,
+            'april': 4,
+            'may': 5,
+            'june': 6,
+            'july': 7,
+            'august': 8,
+            'september': 9, 
+            'october': 10,
+            'november': 11,
+            'december': 12,
+            'nan': 0
+    }
+    
+    return mon_dict.get(shortMonth, 0)
+
+
+udf_func = udf(monthToNum, IntegerType()) 
+
+
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_4_mapping_new_product_positioning/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+#spark.conf.set( "spark.sql.crossJoin.enabled" , "false" )
+
+
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_7_1_transactional_data", transformation_ctx = "datasource00")
+prod_details = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_2_1_product_details_mendix", transformation_ctx = "datasource7")
+forward_looking_rmc  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_21_mapping_forward_looking_rmc", transformation_ctx = "datasource10")
+price_positioning_map  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_7_mapping_new_product_positioning", transformation_ctx = "datasource11")
+
+price_positioning_map = price_positioning_map.toDF().select("prod_grp", "pg_cost", "pg_cm")
+bw_data = bw_data.toDF()
+prod_details = prod_details.toDF()
+sales_org = bw_data.select("sales_org").distinct()
+sales_org1 = prod_details.select("sales_org").distinct()
+prod_details_sales = prod_details.select("prod_grp", "sales_org").distinct()
+
+
+prod_details_sales.show(2)
+
+def check_prod(pg, so):
+    return prod_details_sales.filter((prod_details_sales.prod_grp == pg) & (prod_details_sales.sales_org == so)).count()
+    
+sales_func = udf(check_prod, IntegerType()) 
+
+
+sales_org = sales_org.union(sales_org1).distinct()
+
+print(sales_org.union(sales_org1).distinct().count())
+
+bw_data = bw_data.filter(col('12_month_rolling') == "Yes")
+bw_data = bw_data.filter(col('transactional_vol_kg') > 0.0)
+bw_data = bw_data.filter(bw_data.current_vpc_kg_eur != 0.0)
+bw_data = bw_data.filter(bw_data.current_vpc_kg_eur.isNotNull())
+bw_data = bw_data.filter(bw_data.cmstd_kg_eur.isNotNull())
+bw_data = bw_data.filter(~isnan(bw_data.current_vpc_kg_eur))
+bw_data = bw_data.filter(~isnan(bw_data.cmstd_kg_eur))
+
+print(bw_data.count())
+
+sales_org = sales_org.toPandas()
+sales_org = sales_org['sales_org'].tolist()
+
+forward_looking_rmc = forward_looking_rmc.toDF().withColumnRenamed("month", "month_rmc").withColumnRenamed("rmc_manual_shipto_emea", "emea").withColumnRenamed("rmc_manual_shipto_na", "nam").withColumnRenamed("rmc_manual_shipto_latam", "latam").withColumnRenamed("rmc_manual_shipto_apac", "apac")
+
+forward_looking_rmc = forward_looking_rmc.withColumn("month_rmc", udf_func(col("month_rmc")))
+forward_looking_rmc = forward_looking_rmc.fillna(0.0, subset=["nam", "latam", "apac", "emea"])
+forward_looking_rmc = forward_looking_rmc.withColumn("vpc", (col("nam") + col("latam") + col("apac") + col("emea"))/4.0)
+forward_looking_rmc = forward_looking_rmc.sort(forward_looking_rmc.year.desc(), forward_looking_rmc.month_rmc.desc()).coalesce(1)
+forward_looking_rmc = forward_looking_rmc.drop_duplicates(['unpacked_product_code'])
+forward_looking_rmc = forward_looking_rmc.select("unpacked_product_code", "vpc")
+
+prod_list1 = bw_data.select("prod_grp", "current_vpc_kg_eur", "cmstd_kg_eur", "cust_number")
+prod_list2 = prod_details.select('prod_grp', 'unpacked_product_code')
+
+prod_list1 = prod_list1.groupBy("prod_grp").agg(func.expr('count(distinct cust_number)').alias("no_of_customers"), count("cmstd_kg_eur").alias("no_of_sizeable_transactions"), mean("current_vpc_kg_eur").alias("pg_cost_stats"), mean("cmstd_kg_eur").alias("pg_cm_stats"))
+
+print("\n \n")
+prod_list1.show(3)
+
+prod_grp_list = prod_list1.select('prod_grp').distinct()
+
+prod_grp_list = prod_grp_list.toPandas()
+prod_grp_list = prod_grp_list['prod_grp'].tolist()
+
+print("\n \n  Check if product groups are filtered out")
+print(prod_list2.count())
+
+prod_list2 = prod_list2.filter(~(prod_list2.prod_grp.isin(prod_grp_list)))
+
+print(prod_list2.count())
+
+prod_list2 = prod_list2.join(broadcast(forward_looking_rmc), "unpacked_product_code" ,'left')
+prod_list2 = prod_list2.withColumn("cmstd_kg_eur", lit(0.0))
+prod_list2 = prod_list2.withColumn("no_of_customers", lit(0.0))
+prod_list2 = prod_list2.withColumn("no_of_sizeable_transactions", lit(0.0))
+
+prod_list2 = prod_list2.groupBy("prod_grp").agg(mean('no_of_customers').alias("no_of_customers"), mean("no_of_sizeable_transactions").alias("no_of_sizeable_transactions"), mean("vpc").alias("pg_cost_stats"), mean("cmstd_kg_eur").alias("pg_cm_stats"))
+
+print("\n \n")
+prod_list2.show(3)
+
+print("Intersection checkk")
+
+prod_list1.select('prod_grp').intersect(prod_list2.select('prod_grp')).show()
+
+prod_list = prod_list1.union(prod_list2).select("prod_grp", "no_of_customers", "no_of_sizeable_transactions", "pg_cost_stats", "pg_cm_stats")
+
+prod_list = prod_list.join(price_positioning_map, 'prod_grp', 'left')
+
+prod_list = prod_list.fillna(" ", subset=['pg_cost', 'pg_cm'])
+
+print("\n \n")
+
+prod_grp_list_new = prod_list.select('prod_grp').distinct()
+prod_grp_list_new = prod_grp_list_new.toPandas()
+prod_grp_list_new = prod_grp_list_new['prod_grp'].tolist()
+
+
+
+print("\n \n  Check if product groups are filtered out")
+#print(price_positioning.count())
+
+#price_positioning = price_positioning.filter(~(price_positioning.prod_grp.isin(prod_grp_list_new)))
+
+print("\n \n  Check if product groups are filtered out")
+#print(price_positioning.count())
+
+#price_positioning = price_positioning.union(prod_list)
+
+print("\n \n")
+#price_positioning.show(3)
+
+print("\n sales org \n")
+
+prod_details_sales = prod_details_sales.groupBy("prod_grp").agg(collect_set('sales_org').alias('sales_org'))
+
+for so in sales_org:
+    prod_details_sales = prod_details_sales.withColumn("sales_org_" + so, when(array_contains(prod_details_sales.sales_org, so), "Yes").otherwise("No"))
+    
+print("Product Details Sales \n \n")
+
+
+prod_details_sales = prod_details_sales.drop("sales_org")
+
+prod_details_sales.show()
+
+price_positioning = prod_list.alias("price_positioning")
+pfam_lookup = prod_details.select("prod_grp", "pfam")
+
+pfam_lookup = pfam_lookup.drop_duplicates(['prod_grp'])
+
+pfam_lookup = pfam_lookup.withColumn("pfam", pfam_lookup.pfam.cast(StringType()))
+pfam_lookup = pfam_lookup.withColumn("pfam", substring('pfam', 5, 3))
+
+price_positioning = price_positioning.join(pfam_lookup, "prod_grp", 'left')
+
+price_positioning = price_positioning.join(broadcast(prod_details_sales), "prod_grp", "left")
+
+
+print(price_positioning.columns)
+
+for so in sales_org:
+    price_positioning = price_positioning.na.fill(value="No", subset=["sales_org_" + so])
+    price_positioning = price_positioning.withColumn("sales_org_" + so, when(col("sales_org_" + so).isNull(), "No").otherwise(col("sales_org_" + so)))
+ 
+
+print('*' * 30)
+
+
+
+prod_list_df = DynamicFrame.fromDF(price_positioning, glueContext,"prod_list_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = prod_list_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_4_mapping_new_product_positioning"}, format = "parquet", transformation_ctx = "datasink4")
+
+#3.3.7 Mendix Blacklist prodgrp salesorg
+
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_7_mendix_blacklist_prodgrp_salesorg/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+#unpivot the sales_org from price positioning file
+#unpivotExpr = "stack(17, 'sales_org_or20', sales_org_or20,	'sales_org_1s20', sales_org_1s20,	'sales_org_b820', sales_org_b820,	'sales_org_mx20', sales_org_mx20,	'sales_org_ik20', sales_org_ik20,	'sales_org_nl20', sales_org_nl20,	'sales_org_su20', sales_org_su20,	'sales_org_2q20', sales_org_2q20,	'sales_org_1d20', sales_org_1d20,	'sales_org_4e20', sales_org_4e20,	'sales_org_by20', sales_org_by20,	'sales_org_er20', sales_org_er20,	'sales_org_if20', sales_org_if20,	'sales_org_th20', sales_org_th20,	'sales_org_ls20', sales_org_ls20,	'sales_org_i120', sales_org_i120,	'sales_org_4c20', sales_org_4c20) as (sales_org,value)"
+unpivotExpr = "stack(" + str(len(sales_org))
+
+for s_o in sales_org:
+    
+    unpivotExpr = unpivotExpr + ", 'sales_org_" + s_o.lower() + "', sales_org_" + s_o.lower()
+    
+unpivotExpr = unpivotExpr + ") as (sales_org, value)"
+
+print(unpivotExpr)
+
+price_positioning.show(6)
+
+unPivotDF = price_positioning.select("prod_grp", expr(unpivotExpr))
+unPivotDF.show(5)
+
+unPivotDF.select("value").distinct().show(5)
+
+#select the required column
+prod_details = prod_details.select("prod_grp").distinct()
+prod_list = prod_details.toPandas()
+prod_list = prod_list['prod_grp'].tolist()
+
+unPivotDF = unPivotDF.filter(unPivotDF.value == "No")
+
+prod_blacklist_details = unPivotDF.filter(unPivotDF.prod_grp.isin(prod_list))
+
+prod_blacklist_details.select("value").distinct().show(5)
+
+
+prod_blacklist_details = prod_blacklist_details.select("prod_grp", "sales_org")
+
+prod_blacklist_details = prod_blacklist_details.withColumn('sales_org', regexp_replace('sales_org', 'sales_org_', ''))
+
+prod_blacklist_details = prod_blacklist_details.withColumn('sales_org', upper(prod_blacklist_details.sales_org))
+
+
+prod_blacklist_details = prod_blacklist_details.withColumn('upload_date', current_timestamp())
+prod_blacklist_details = prod_blacklist_details.withColumn('source_system', lit("Mendix blacklist prodgrp salesorg"))
+
+prod_blacklist_details_df = DynamicFrame.fromDF(prod_blacklist_details, glueContext,"prod_blacklist_details" )
+
+datasink7 = glueContext.write_dynamic_frame.from_options(frame = prod_blacklist_details_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_7_mendix_blacklist_prodgrp_salesorg"}, format = "parquet", transformation_ctx = "datasink7")
+
+job.commit()

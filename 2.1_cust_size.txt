@@ -1,0 +1,215 @@
+import sys
+import boto3
+import pandas as pd
+import numpy as np
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from datetime import datetime
+
+
+
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_1_cust_desc_cust_group_adj_cust_segment/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_2_bw_transaction_data", transformation_ctx = "datasource0")
+cust_grp_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_23_mapping_customers_to_customer_group_and_ml2", transformation_ctx = "datasource13")
+knvv  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_knvv", transformation_ctx = "datasource04")
+kna1  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_kna1", transformation_ctx = "datasource1")
+
+bw_data = bw_data.toDF()
+
+cust_grp_map = bw_data.selectExpr("sold_to_party as cust_number", "marketing_customer_sold_to as cust_grp_adj", "fiscal_year", "posting_period as month")
+cust_grp_map = cust_grp_map.withColumn('cust_number', lpad(cust_grp_map.cust_number.cast(StringType()), 10, '0'))
+cust_grp_map = cust_grp_map.sort(cust_grp_map.cust_number, cust_grp_map.fiscal_year.desc(), cust_grp_map.month.desc())
+cust_grp_map = cust_grp_map.drop_duplicates(["cust_number"])
+cust_grp_map = cust_grp_map.drop("fiscal_year", "month")
+
+
+knvv = knvv.toDF().selectExpr("kunnr", "loevm")
+kna1 = kna1.toDF().selectExpr("name1 as cust_descrp", "kunnr", "ktokd", "loevm as loevm_kna1")
+
+
+knvv = knvv.withColumn('kunnr', lpad(knvv.kunnr.cast(StringType()), 10, '0'))
+kna1 = kna1.withColumn('kunnr', lpad(kna1.kunnr.cast(StringType()), 10, '0'))
+
+
+cust_list = bw_data.select("sold_to_party")
+cust_list = cust_list.withColumn('sold_to_party', lpad(cust_list.sold_to_party.cast(StringType()), 10, '0')).distinct().toPandas()['sold_to_party'].tolist()
+
+
+knvv = knvv.join(kna1, "kunnr" ,'left')
+
+knvv = knvv.filter(knvv.loevm_kna1 != "X")
+knvv = knvv.filter(knvv.ktokd == "0001")
+
+knvv = knvv.filter(knvv.loevm != "X")
+
+knvv = knvv.drop_duplicates(["kunnr"])
+
+print(len(set(knvv.select('kunnr').distinct().toPandas()['kunnr'].tolist()).difference(set(cust_list))))
+
+knvv = knvv.filter(~knvv.kunnr.isin(cust_list))
+print(knvv.count())
+
+knvv = knvv.selectExpr("kunnr as cust_number", "cust_descrp")
+knvv = knvv.withColumn('cmstd_eur', lit(0.0))
+knvv = knvv.withColumn('cmstd_eur', knvv.cmstd_eur.cast(DoubleType()))
+
+
+'''
+knvv = knvv.withColumn('date', concat(lit(year(current_date())), lit("-"), lit(month(current_date())), lit("-01")))
+knvv = knvv.withColumn('date', col('date').cast(DateType()))
+knvv = knvv.withColumn('date_12', concat(lit(year(current_date())), lit("-"), lit(month(current_date())), lit("-01")))
+knvv = knvv.withColumn('date_12', col('date_12').cast(DateType()))
+'''
+
+bw_data = bw_data.withColumnRenamed("sold_to_party", "cust_number").withColumnRenamed("marketing_customer_sold_to", "cust_grp_adj").withColumnRenamed("sold_to_party_description", "cust_descrp").withColumnRenamed("consolidated_marginal_income_eur", "cmstd_eur").withColumnRenamed("posting_period", "month")
+
+cust_grp_ml2 = cust_grp_ml2.toDF().selectExpr("customer_sold_to as cust_number", "marketing_customer_ship_to_description as cust_grp_adj2") #"marketing_customer_ship_to as cust_grp_adj_id", "ml_2 as ibg"
+
+cust_grp_ml2 = cust_grp_ml2.withColumn('cust_number', lpad(cust_grp_ml2.cust_number, 10, '0'))
+
+knvv = knvv.join(broadcast(cust_grp_map), "cust_number" ,'left')
+knvv = knvv.join(broadcast(cust_grp_ml2), "cust_number" ,'left')
+
+knvv = knvv.withColumn('cust_grp_adj', when(((isnan(knvv.cust_grp_adj)) | knvv.cust_grp_adj.isNull()), knvv.cust_grp_adj2).otherwise(knvv.cust_grp_adj))
+
+knvv = knvv.drop("cust_grp_adj2")
+
+print("\n 11 \n")
+
+bw_data.printSchema()
+
+bw_data = bw_data.withColumn('cust_number', lpad(bw_data.cust_number, 10, '0'))
+
+print("\n 12 \n")
+bw_data = bw_data.withColumn('date', concat(col('fiscal_year'), lit("-"), col('month'), lit("-01")))
+bw_data = bw_data.withColumn('date', col('date').cast(DateType()))
+print("\n 13 \n")
+bw_data = bw_data.withColumn('date_12', concat(lit(year(current_date()) - 1), lit("-"), lit(month(current_date())), lit("-01")))
+bw_data = bw_data.withColumn('date_12', col('date_12').cast(DateType()))
+
+bw_data = bw_data.join(broadcast(cust_grp_ml2), "cust_number" ,'left')
+
+bw_data = bw_data.withColumn('cust_grp_adj', when(((isnan(bw_data.cust_grp_adj)) | bw_data.cust_grp_adj.isNull()), bw_data.cust_grp_adj2).otherwise(bw_data.cust_grp_adj))
+
+bw_data = bw_data.drop("cust_grp_adj2")
+
+bw_df = bw_data.filter(bw_data.date >= bw_data.date_12)
+
+
+
+print("\n 1 \n")
+bw_df = bw_df.select("cust_number", "cust_descrp", "cmstd_eur", "cust_grp_adj")
+
+print("\n 2 \n")
+
+
+bw_df = bw_df.groupBy("cust_grp_adj").agg(sum("cmstd_eur").alias("cmstd_eur_sum"))
+print("\n 3 \n")
+
+
+bw_df = bw_df.select("cust_grp_adj", "cmstd_eur_sum").toPandas()
+
+print("\n 4 \n")
+
+bw_df['cmstd_str'] = bw_df['cmstd_eur_sum']
+
+
+bw_df['cmstd_eur_sum'] = pd.to_numeric(bw_df['cmstd_eur_sum'])
+
+bw_df['cmstd_eur_sum'] = bw_df['cmstd_eur_sum'].fillna(0.0)
+
+perc90 = bw_df.cmstd_eur_sum.quantile(0.9) 
+perc80 = bw_df.cmstd_eur_sum.quantile(0.8)
+
+print("\n 90 \n  " + str(perc90))
+print("\n 80 \n  " + str(perc80))
+
+conditions = [
+    (bw_df['cmstd_eur_sum'] >= perc90),
+    (bw_df['cmstd_eur_sum'] < perc90) & (bw_df['cmstd_eur_sum'] >= perc80),
+    (bw_df['cmstd_eur_sum'] < perc80)]
+
+
+choices = ['Large', 'Medium', 'Small']
+
+bw_df['cust_segment'] = np.select(conditions, choices)
+
+print(bw_df['cmstd_str'].unique()[0:10])
+
+print(bw_df['cmstd_eur_sum'].unique()[0:10])
+
+
+
+print("hmmm")
+
+cust_size = spark.createDataFrame(bw_df)
+
+
+cust_size.show()
+
+cust_size = cust_size.select("cust_grp_adj", "cust_segment")
+
+bw_data = bw_data.select("cust_number", "cust_descrp", "cmstd_eur",  "cust_grp_adj")
+bw_data = bw_data.union(knvv)
+bw_data = bw_data.groupBy("cust_number", "cust_descrp", "cust_grp_adj").agg(sum("cmstd_eur").alias("tmp"))
+
+bw_data = bw_data.join(broadcast(cust_size), "cust_grp_adj" ,'left')
+
+bw_data = bw_data.selectExpr("cust_number", "cust_descrp", "cust_grp_adj", "cust_segment")
+
+
+
+bw_data = bw_data.fillna("Small", subset=['cust_segment'])
+
+
+bw_data = bw_data.withColumn('upload_date', current_timestamp())
+bw_data = bw_data.withColumn('source_system', lit("Customer Size classification"))
+
+cust_size_df = DynamicFrame.fromDF(bw_data, glueContext,"bw_data_df" )
+
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = cust_size_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_1_cust_desc_cust_group_adj_cust_segment"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+job.commit()
+
+
+
+
+
+
+

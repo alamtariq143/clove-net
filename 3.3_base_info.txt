@@ -1,0 +1,285 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from pyspark.sql.functions import udf
+import pyspark.sql.functions as func 
+from datetime import datetime
+
+
+
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_base_info/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_base_info_sample/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])        
+
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_1_base_info_for_matrix_country_grp/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_1_base_info_for_matrix_country_group/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_2_base_info_for_matrix_customer_size/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_3_3_base_info_for_matrix_volume_brackets/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+spark.conf.set( "spark.sql.crossJoin.enabled" , "false" )
+
+
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_7_1_transactional_data", transformation_ctx = "datasource00")
+volume_index  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_2_mapping_volume_index", transformation_ctx = "datasource01")
+volume_bracket  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_1_mapping_volume_index_bracket", transformation_ctx = "datasource01")
+
+acc_mgr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_14_mapping_accountmanager_input", transformation_ctx = "datasource8")
+
+
+bw_data = bw_data.toDF()
+volume_index = volume_index.toDF().selectExpr("pline as pfam", "volume_index")
+volume_bracket = volume_bracket.toDF().selectExpr("volume_index", "min", "max", "bracket as yearly_volume_bracket")
+volume_bracket = volume_bracket.drop_duplicates()
+#volume_index = volume_index.withColumn("pline", element_at(split(volume_index.pline, "/"), -1))
+
+bw_data = bw_data.filter(col('12_month_rolling') == "Yes")
+
+bw_data = bw_data.fillna(0.0, subset=['reb_kg_eur', 'frght_kg_eur', 'othvse_kg_eur'])
+
+
+bw_data = bw_data.withColumn('pfam', lpad(bw_data.pfam.cast(StringType()), 3, '0'))
+
+bw_data = bw_data.withColumn("pfam", concat(bw_data.bu, lit("/"), bw_data.pfam))
+bw_data = bw_data.withColumn("giv_abs", bw_data.giv_kg_eur * bw_data.transactional_vol_kg)
+bw_data = bw_data.withColumn("rxcxp", concat(bw_data.cxp_region , lit("-") , bw_data.cust_grp_adj, lit("-"), bw_data.prod_grp))
+
+rxcxp = bw_data.select("rxcxp").distinct().toPandas()["rxcxp"].tolist()
+
+rcp_count = {}
+
+for rcp in rxcxp:
+    rcp_count[rcp] = 0
+
+def countif(rcxp):
+    
+    rcp_count[rcxp] = rcp_count[rcxp] + 1
+    return rcp_count[rcxp]
+    
+countif_func = udf(countif, IntegerType()) 
+
+print("Base \n \n")
+print(bw_data.count())
+
+
+bw_data = bw_data.join(broadcast(volume_index), "pfam" ,'left')
+
+
+print("Join 1 \n \n")
+print(bw_data.count())
+
+bw_data_yearly = bw_data.filter(col('12_month_rolling') == "Yes").select("rxcxp", "transactional_vol_kg")
+
+bw_data_yearly = bw_data_yearly.groupBy("rxcxp").agg(sum("transactional_vol_kg").alias("yearly_volume_rxcxp"))
+
+bw_data_yearly = bw_data_yearly.select("rxcxp", "yearly_volume_rxcxp")
+
+bw_data = bw_data.join(broadcast(bw_data_yearly), "rxcxp" ,'left')
+
+print("Join 2 \n \n")
+print(bw_data.count())
+
+
+join_cond = [(bw_data.volume_index == volume_bracket.volume_index) & (bw_data.yearly_volume_rxcxp >= volume_bracket.min) & (bw_data.yearly_volume_rxcxp < volume_bracket.max)]
+
+bw_data = bw_data.join(broadcast(volume_bracket), join_cond ,'left')
+
+print("Join 3 \n \n")
+print(bw_data.count())
+
+bw_data = bw_data.withColumn("reb_kg", bw_data.reb_kg_eur * bw_data.transactional_vol_kg)
+bw_data = bw_data.withColumn("current_vpc_kg", bw_data.current_vpc_kg_eur * bw_data.transactional_vol_kg)
+bw_data = bw_data.withColumn("frght_kg", bw_data.frght_kg_eur * bw_data.transactional_vol_kg)
+bw_data = bw_data.withColumn("othvse_kg", bw_data.othvse_kg_eur * bw_data.transactional_vol_kg)
+
+bw_data = bw_data.withColumn("cost_eur_kg", ((bw_data.reb_kg + bw_data.current_vpc_kg + bw_data.frght_kg + bw_data.othvse_kg) / bw_data.transactional_vol_kg))
+
+bw_data = bw_data.withColumn("new_price_eur_kg", bw_data.giv_kg_eur)
+
+bw_data = bw_data.withColumn("new_cm_eur_kg", bw_data.new_price_eur_kg - bw_data.cost_eur_kg)
+
+bw_data = bw_data.withColumn("new_cm_abs", bw_data.new_cm_eur_kg * bw_data.transactional_vol_kg)
+
+
+bw_data_yearly_cm = bw_data.select("rxcxp", "new_cm_abs")
+
+bw_data_yearly_cm = bw_data_yearly_cm.groupBy("rxcxp").agg(sum("new_cm_abs").alias("total_rxcxp_cm_abs"))
+
+bw_data_yearly_cm = bw_data_yearly_cm.select("rxcxp", "total_rxcxp_cm_abs")
+
+bw_data = bw_data.join(broadcast(bw_data_yearly_cm), "rxcxp" ,'left')
+
+print("Join 4 \n \n")
+print(bw_data.count())
+
+#bw_data = bw_data.withColumn("total_rxcxp_cm_abs", bw_data.new_cm_eur_kg * bw_data.yearly_volume_rxcxp)
+
+bw_data = bw_data.coalesce(1)  ##very imp for the udf function, do not remove!!!
+
+bw_data = bw_data.withColumn("instance_rxcxp", countif_func(bw_data.rxcxp))
+
+
+bw_data = bw_data.withColumn("avg_rxcxp_cm_kg_eur", when(bw_data.instance_rxcxp == 1, bw_data.total_rxcxp_cm_abs/bw_data.yearly_volume_rxcxp).otherwise(0))
+
+
+##should i put instance rxcxp == 1?? 
+## try and see the numbers 
+## there shouldnt be a need since avg rxcxp cm kg eur is only calculated for instance = 1
+bw_data_yearly_cm_pg = bw_data.select("prod_grp", "avg_rxcxp_cm_kg_eur")
+
+bw_data_yearly_cm_pg = bw_data_yearly_cm_pg.groupBy("prod_grp").agg(mean("avg_rxcxp_cm_kg_eur").alias("avg_pg_cm_kg_eur"))
+
+bw_data_yearly_cm_pg = bw_data_yearly_cm_pg.select("prod_grp", "avg_pg_cm_kg_eur")
+
+bw_data = bw_data.join(broadcast(bw_data_yearly_cm_pg), [(bw_data.prod_grp == bw_data_yearly_cm_pg.prod_grp) & (bw_data.instance_rxcxp == 1)] ,'left')
+
+print("Join 5 \n \n")
+print(bw_data.count())
+
+
+# End of pipe account swap
+acc_mgr = acc_mgr.toDF().selectExpr("ml2 as ibg","customer as cust_number", "sales_org", "am_responsible")
+acc_mgr_cust_specic = acc_mgr
+acc_mgr_all_cust = acc_mgr.filter(acc_mgr.cust_number.isNull()).drop('cust_number')
+
+bw_data = bw_data.join(acc_mgr_cust_specic, how='left', on=['ibg', 'cust_number', 'sales_org'])
+bw_data = bw_data.withColumn("account_manager", when(bw_data.am_responsible.isNull(), bw_data.account_manager).otherwise(bw_data.am_responsible))
+bw_data = bw_data.drop("am_responsible")
+
+bw_data = bw_data.join(acc_mgr_all_cust, how='left', on=['ibg', 'sales_org'])
+bw_data = bw_data.withColumn("account_manager", when(bw_data.am_responsible.isNull(), bw_data.account_manager).otherwise(bw_data.am_responsible))
+bw_data = bw_data.drop("am_responsible")
+
+
+bw_data = bw_data.withColumn("avg_rxcxp_cm_perc", when(bw_data.instance_rxcxp == 1, bw_data.avg_rxcxp_cm_kg_eur/bw_data.avg_pg_cm_kg_eur).otherwise(0))
+
+pivot_bracket = bw_data.groupBy("yearly_volume_bracket").agg(mean("avg_rxcxp_cm_perc").alias("percentage"))
+pivot_bracket = pivot_bracket.sort(pivot_bracket.yearly_volume_bracket).coalesce(1)
+pivot_bracket = pivot_bracket.withColumn("percentage", round((pivot_bracket.percentage * 100), 2))
+pivot_bracket = pivot_bracket.withColumn("percentage", pivot_bracket.percentage.cast(DoubleType()))
+#pivot_bracket = pivot_bracket.withColumn("percentage", concat(pivot_bracket.percentage, lit('%')))
+pivot_bracket = pivot_bracket.selectExpr("yearly_volume_bracket as volume_bracket", "percentage")
+pivot_bracket = pivot_bracket.withColumn('upload_date', current_timestamp())
+pivot_bracket = pivot_bracket.withColumn('source_system', lit("base_info_for_matrix_volume_brackets"))
+pivot_bracket.show()
+
+pivot_segment = bw_data.groupBy("cust_segment").agg(mean("avg_rxcxp_cm_perc").alias("percentage"))
+pivot_segment = pivot_segment.withColumn("percentage", round((pivot_segment.percentage * 100), 2))
+pivot_segment = pivot_segment.withColumn("percentage", pivot_segment.percentage.cast(DoubleType()))
+#pivot_segment = pivot_segment.withColumn("percentage", concat(pivot_segment.percentage, lit('%')))
+pivot_segment = pivot_segment.selectExpr("cust_segment as customer_size", "percentage")
+pivot_segment = pivot_segment.withColumn('upload_date', current_timestamp())
+pivot_segment = pivot_segment.withColumn('source_system', lit("base_info_for_matrix_customer_size"))
+
+pivot_segment.show()
+
+pivot_region = bw_data.groupBy("country_grp").agg(mean("avg_rxcxp_cm_perc").alias("percentage"))
+pivot_region = pivot_region.withColumn("percentage", round((pivot_region.percentage * 100), 2))
+pivot_region = pivot_region.withColumn("percentage", pivot_region.percentage.cast(DoubleType()))
+#pivot_region = pivot_region.withColumn("percentage", concat(pivot_region.percentage, lit('%')))
+pivot_region = pivot_region.selectExpr("country_grp", "percentage")
+pivot_region = pivot_region.withColumn('upload_date', current_timestamp())
+pivot_region = pivot_region.withColumn('source_system', lit("base_info_for_matrix_country_grp"))
+
+pivot_region.show()
+
+bw_data_sample = bw_data.filter((bw_data.cost_eur_kg == 0.0) | (bw_data.cost_eur_kg > 10.0) |
+                                (bw_data.new_cm_eur_kg < 0.0) |
+                                (bw_data.new_cm_abs < 0.0) |
+                                (bw_data.cmstd_kg_eur < 0.0) |
+                                (bw_data.transactional_vol_kg < 500) |
+                                ((abs(bw_data.vpc_kg_eur - bw_data.current_vpc_kg_eur)/bw_data.vpc_kg_eur) >= 0.1)
+                                )
+
+
+bw_data_samp_df = DynamicFrame.fromDF(bw_data_sample, glueContext, "bw_data_df")
+
+bw_data_df = DynamicFrame.fromDF(bw_data, glueContext, "bw_data_df")
+
+pivot_segment_df = DynamicFrame.fromDF(pivot_segment, glueContext, "pivot_segment_df")
+
+pivot_region_df = DynamicFrame.fromDF(pivot_region, glueContext, "pivot_region_df")
+
+pivot_brackets_df = DynamicFrame.fromDF(pivot_bracket, glueContext, "pivot_bracket_df")
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = bw_data_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_base_info"}, format = "parquet", transformation_ctx = "datasink4")
+
+datasink8 = glueContext.write_dynamic_frame.from_options(frame = bw_data_samp_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_base_info_sample"}, format = "parquet", transformation_ctx = "datasink8")
+
+datasink1 = glueContext.write_dynamic_frame.from_options(frame = pivot_segment_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_2_base_info_for_matrix_customer_size"}, format = "parquet", transformation_ctx = "datasink1")
+
+datasink2 = glueContext.write_dynamic_frame.from_options(frame = pivot_region_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_1_base_info_for_matrix_country_group"}, format = "parquet", transformation_ctx = "datasink2")
+
+datasink12 = glueContext.write_dynamic_frame.from_options(frame = pivot_brackets_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_3_3_base_info_for_matrix_volume_brackets"}, format = "parquet", transformation_ctx = "datasink12")
+
+
+job.commit()

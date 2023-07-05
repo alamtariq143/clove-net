@@ -1,0 +1,131 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+
+
+#args = getResolvedOptions(sys.argv, ['DatabaseName']) 
+
+#Convert table names to lower c ase
+#args["DatabaseName"] = args["DatabaseName"].lower() 
+s3_client = boto3.client('s3')
+
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_4_3_mapping_fx_rate/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+tcurr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_tcurr", transformation_ctx = "datasource0")
+tcurf  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_tcurf", transformation_ctx = "datasource0")
+
+tcurf = tcurf.toDF().selectExpr("fcurr as to_currency", "tcurr as from_currency", "ffact as to_fact", "tfact as from_fact", "kurst")
+tcurf = tcurf.filter(tcurf.kurst == 'DM')
+tcurf = tcurf.filter(tcurf.to_currency == 'EUR')
+tcurf = tcurf.selectExpr("to_currency", "from_currency", "to_fact", "from_fact")
+
+tcurr = tcurr.toDF().selectExpr("fcurr as from_currency", "tcurr as to_currency", "gdatu", "ukurs", "kurst")
+tcurr = tcurr.filter(tcurr.kurst == 'DM')
+
+tcurr = tcurr.join(broadcast(tcurf), ["from_currency", "to_currency"] ,'left')
+tcurr = tcurr.fillna(1, subset=['from_fact', 'to_fact'])
+
+tcurr = tcurr.withColumn('fx_rate', when(tcurr.ukurs >= 0.0, tcurr.ukurs.cast(DoubleType())).otherwise(abs(1.0/tcurr.ukurs.cast(DoubleType())))) #.drop(tcurr.ukurs)
+
+tcurr = tcurr.withColumn('exchange_rate', (tcurr.fx_rate.cast(DoubleType()) * tcurr.to_fact.cast(DoubleType())) / tcurr.from_fact.cast(DoubleType())) #.drop(tcurr.ukurs)
+
+tcurr = tcurr.selectExpr("to_currency", "from_currency", "gdatu", "exchange_rate")
+
+
+tcurr = tcurr.toPandas()
+print(tcurr.dtypes)
+tcurr['gdatu'] = tcurr['gdatu'].astype('int')
+tcurr['exchange_rate'] = tcurr['exchange_rate'].astype('float64')
+
+tcurr['first_date'] = 99999999 - tcurr['gdatu']
+tcurr['first_date'] = tcurr['first_date'].astype(str)
+tcurr['first_date'] = pd.to_datetime(tcurr['first_date']) 
+
+tcurr = tcurr.sort_values(by='first_date', ascending = False)
+
+tcurr = tcurr.drop_duplicates(['from_currency','to_currency'],  keep='first')
+
+print("\n 1 \n")
+tcurr = spark.createDataFrame(tcurr) 
+
+print("\n 2 \n")
+tcurr = tcurr.withColumn("first_date", to_timestamp(tcurr.first_date))
+
+tcurr = tcurr.select("from_currency", "to_currency", "first_date", "exchange_rate")
+
+tcurr_opp = tcurr.alias("tcurr_opp")
+tcurr_opp = tcurr_opp.withColumnRenamed("from_currency", "to")
+tcurr_opp = tcurr_opp.withColumnRenamed("to_currency", "from_currency")
+tcurr_opp = tcurr_opp.withColumnRenamed("to", "to_currency")
+
+tcurr_opp = tcurr_opp.withColumn("exchange_rate", (1.0 / tcurr_opp.exchange_rate.cast(DoubleType())))
+
+tcurr_opp = tcurr_opp.select("from_currency", "to_currency", "first_date", "exchange_rate")
+
+tcurr = tcurr.union(tcurr_opp)
+
+print("\n 3 \n")
+
+newrow_eur = spark.createDataFrame([("EUR","EUR", "", 1.0)], tcurr.columns)
+
+print("\n 4 \n")
+
+newrow_eur = newrow_eur.withColumn('first_date', current_timestamp())
+
+print("\n 5 \n")
+
+tcurr = tcurr.union(newrow_eur)
+print("\n 6 \n")
+tcurr = tcurr.withColumn('upload_date', current_timestamp())
+tcurr = tcurr.withColumn('source_system', lit("sap_p1p_tcurr"))
+
+print("\n 7 \n")
+
+tcurr = tcurr.select("from_currency", "to_currency", "first_date", "exchange_rate", "upload_date", "source_system")
+
+tcurr.show(n=2)
+
+mapping_fx_rate_df = DynamicFrame.fromDF(tcurr, glueContext,"mapping_fx_rate_df" )
+
+print("\n 8 \n")
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = mapping_fx_rate_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_4_3_mapping_fx_rate"}, format = "parquet", transformation_ctx = "datasink4")
+
+job.commit()
+
+
+
+
+
+
+

@@ -1,0 +1,204 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *     
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+
+#args = getResolvedOptions(sys.argv, ['DatabaseName']) 
+
+#Convert table names to lower case
+#args["DatabaseName"] = args["DatabaseName"].lower() 
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+s3_client = boto3.client('s3')
+
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_2_1_product_details_mendix/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_2_3_product_details_mendix_data_check/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+mara  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_mara", transformation_ctx = "datasource0")
+t179  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_t179", transformation_ctx = "datasource2")
+mvke  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_mvke", transformation_ctx = "datasource3")
+marc  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_marc", transformation_ctx = "datasource4")
+prod_type  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_16_mapping_ph3_prod_type_chemistry", transformation_ctx = "datasource5")
+vol_index = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_2_mapping_volume_index", transformation_ctx = "datasource6")
+plant = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_18_mapping_plant_details", transformation_ctx = "datasource7")
+sales_org = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_24_mapping_thresholds_salesorg", transformation_ctx = "datasource8")
+
+sales_org = sales_org.toDF()
+sales_org = sales_org.withColumn('sales_org_id', sales_org.sales_org_id.cast(StringType()))
+sales_org = sales_org.select("sales_org_id").distinct()
+sales_org = sales_org.toPandas()
+sales_org = sales_org['sales_org_id'].tolist()
+
+mara = mara.toDF().withColumnRenamed("/bay0/ms_loswa", "lowsa").withColumnRenamed("/bay0/ms_uvp", "unpacked_product_code").selectExpr("matnr","lowsa","maktx", "prdha", "unpacked_product_code", "mtart", "mstae")
+
+mara_produced = mara.filter(mara.mtart != "YV").select("matnr","maktx").selectExpr("matnr as unpacked_product_code", "maktx as prod_grp")
+
+mara = mara.withColumn("mstae", mara.mstae.cast(IntegerType()))
+mara = mara.filter(mara.mstae == 4)
+
+mara = mara.filter(mara.mtart == "YV").selectExpr("matnr as prod_number", "lowsa", "unpacked_product_code", "maktx as prod_descrp", "prdha")
+
+mara = mara.join(broadcast(mara_produced), "unpacked_product_code", "left")
+
+t179 = t179.toDF()
+prod_type = prod_type.toDF().withColumnRenamed("prod.hier.3", "pfam").selectExpr("pfam", "prod_type", "chemistry as prod_chemistry")
+vol_index = vol_index.toDF().withColumnRenamed("pline", "pfam").selectExpr("pfam", "volume_index")
+#prod_type = prod_type.toDF().selectExpr("prod.hier.3 as pfam", "prod_type", "chemistry as prod_chemistry")
+#vol_index = vol_index.toDF().b vbg("pline as pfam", "volume_index")
+mvke = mvke.toDF().selectExpr("vkorg as sales_org", "matnr as prod_number", "vmsta")
+plant = plant.toDF().selectExpr("plant", "plant_descrp as plant_of_origin")
+marc = marc.toDF().selectExpr("matnr as prod_number", "werks as plant")
+
+marc = marc.filter(marc.prod_number.isNotNull())
+marc = marc.filter(~isnan(marc.prod_number))
+mvke = mvke.withColumn('sales_org', mvke.sales_org.cast(StringType()))
+
+
+prod_type = prod_type.withColumn('pfam', regexp_replace('pfam', '/', ''))
+vol_index = vol_index.withColumn('pfam', regexp_replace('pfam', '/', ''))
+
+mara = mara.toPandas()
+
+mara['prdha'] = mara['prdha'].fillna("")
+
+mara['prdha'] = mara['prdha'].astype(str)
+mara['ph1'] = mara['prdha'].str.slice(0,2)
+mara['bu'] = mara['prdha'].str.slice(0,4)
+#mara['ph3'] = mara['prdha'].str.slice(0,7)
+#mara['ph4'] = mara['prdha'].str.slice(0,10)
+mara['pfam'] = mara['prdha'].str.slice(0,7)
+mara['pline'] = mara['prdha'].str.slice(0,10)
+
+mara = mara[mara['ph1'] == '75']
+
+mara['ph1'] = mara['ph1'].fillna("")
+mara['bu'] = mara['bu'].fillna("")
+mara['pfam'] = mara['pfam'].fillna("")
+mara['pline'] = mara['pline'].fillna("")
+
+print("check")
+
+mara = spark.createDataFrame(mara) 
+
+#dyf_join = Join.apply(knvv, kna1, 'kunnr', 'kunnr')
+#dyf_join.printSchema()
+
+t179.show(n=2)
+
+mara = mara.join(broadcast(prod_type), "pfam", 'left')
+mara = mara.join(broadcast(t179.filter(t179.STUFE == '3').selectExpr("PRODH as pfam", "VTEXT as pfam_descrp")), "pfam" ,'left')
+mara = mara.join(broadcast(t179.filter(t179.STUFE == '4').selectExpr("PRODH as pline", "VTEXT as pline_descrp")), "pline" ,'left')
+mara = mara.join(broadcast(mvke), "prod_number", 'left')
+
+mara = mara.filter((mara.vmsta >= 4) & (mara.vmsta <= 7))
+
+mara = mara.join(broadcast(vol_index), "pfam", 'left')
+mara = mara.join(broadcast(marc), "prod_number", 'left')
+mara = mara.join(broadcast(plant), "plant", 'left')
+
+mara = mara.filter(mara.sales_org.isin(sales_org))
+
+mara = mara.drop("plant")
+
+mara = mara.groupBy("prod_grp","prod_number","prod_descrp","prod_type", "unpacked_product_code", "pfam","pfam_descrp","pline","pline_descrp","bu","sales_org","volume_index","prod_chemistry", "vmsta").agg(collect_set("plant_of_origin").alias("plant_of_origin"))
+
+mara = mara.withColumn("plant_of_origin", concat_ws(",", "plant_of_origin"))
+
+mara = mara.filter(~mara.prod_descrp.endswith("S001"))
+
+
+mara = mara.withColumn('upload_date', current_timestamp())
+mara = mara.withColumn('source_system', lit("product_details_mendix"))
+
+mara = mara.selectExpr("prod_grp","prod_number","prod_descrp","prod_type", "unpacked_product_code", "pfam","pfam_descrp","pline","pline_descrp","bu","sales_org","volume_index", "plant_of_origin","prod_chemistry", "vmsta","upload_date","source_system")
+
+print('*' * 30)
+
+mara.show(n=2)
+
+prod_details_df = DynamicFrame.fromDF(mara, glueContext,"prod_details_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = prod_details_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_2_1_product_details_mendix"}, format = "parquet", transformation_ctx = "datasink4")
+
+#data check 
+data_check = mara.filter((mara.prod_grp.isNull()) | 
+                               (mara.prod_number.isNull()) |
+                               (mara.prod_descrp.isNull()) | 
+                               (mara.prod_type.isNull()) |
+                               (mara.unpacked_product_code.isNull()) | 
+                               (mara.pfam.isNull()) | 
+                               (mara.pfam_descrp.isNull()) | 
+                               (mara.pline.isNull()) | 
+                               (mara.pline_descrp.isNull()) | 
+                               (mara.bu.isNull()) | 
+                               (mara.sales_org == '#') | 
+                               (mara.volume_index.isNull()) | 
+                               (mara.plant_of_origin.isNull()) | 
+                               (mara.prod_chemistry.isNull()) | 
+                               (mara.vmsta.isNull())
+                               )
+
+data_check = data_check.withColumn("remarks", 
+                               when((mara.prod_grp.isNull()), lit("prod_grp")) \
+                               .when((mara.prod_number.isNull()), lit("prod_number")) \
+                               .when((mara.prod_descrp.isNull()), lit("prod_descrp")) \
+                               .when((mara.prod_type.isNull()), lit("prod_type")) \
+                               .when((mara.unpacked_product_code.isNull()), lit("unpacked_product_code")) \
+                               .when((mara.pfam.isNull()), lit("pfam")) \
+                               .when((mara.pfam_descrp.isNull()), lit("pfam_descrp")) \
+                               .when((mara.pline.isNull()), lit("pline")) \
+                               .when((mara.pline_descrp.isNull()), lit("pline_descrp")) \
+                               .when((mara.bu.isNull()), lit("bu")) \
+                               .when((mara.sales_org == '#'), lit("sales_org")) \
+                               .when((mara.volume_index.isNull()), lit("volume_index")) \
+                               .when((mara.plant_of_origin.isNull()), lit("plant_of_origin")) \
+                               .when((mara.prod_chemistry.isNull()), lit("prod_chemistry")) \
+                               .when((mara.vmsta.isNull()), lit("vmsta")) \
+                               )
+
+data_check_df = DynamicFrame.fromDF(data_check, glueContext,"data_check_df" )
+
+datasink7 = glueContext.write_dynamic_frame.from_options(frame = data_check_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_2_3_product_details_mendix_data_check"}, format = "parquet", transformation_ctx = "datasink7")
+
+
+job.commit()
+
+
+
+

@@ -1,0 +1,1223 @@
+
+import sys
+import io
+import boto3
+import math
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from pyspark.sql.functions import *
+import pyspark.sql.functions as func 
+from datetime import datetime
+from builtins import abs as abs_p
+from builtins import round as round_p
+
+def suggested_price_cm(srp, srp_cm, nm, nm_cm, cut_off, cut_off_cm, rm, rm_cm, out, out_cm, giv, cmstd):
+    
+    #Negative Margin Lens is available
+    price = giv
+    cm = cmstd
+    most_relavant = 1.0
+    if ((srp is not None) and (srp != 0) and (~math.isnan(srp)) and (srp != '') and (~(srp != srp)) and (srp_cm is not None) and (~math.isnan(srp_cm)) and (srp_cm != 0) and (srp_cm != '') and (~(srp_cm != srp_cm))):
+        price = srp
+        cm = srp_cm
+        most_relavant = 2.0
+    else:
+        if ((nm is not None) and (nm != 0) and (nm != '') and (~math.isnan(nm)) and (nm_cm is not None) and (nm_cm != '') and (~math.isnan(nm_cm))):
+            price = nm
+            cm = nm_cm
+            most_relavant = 3.0
+        #Negative Margin Lens is not available
+        else:
+            #Cut off Lens is available
+            if ((cut_off is not None) and (cut_off != 0) and (cut_off != '') and (~math.isnan(cut_off)) and (cut_off_cm is not None) and (cut_off_cm != 0) and (cut_off_cm != '') and (~math.isnan(cut_off_cm))):
+                price = cut_off
+                cm = cut_off_cm
+                most_relavant = 4.0
+            #Cut off Lens is not available
+            else:
+                #RM passthrough Lens is available
+                if ((rm is not None) and (rm != 0) and (rm != '') and (~math.isnan(rm)) and (rm_cm is not None) and (rm_cm != 0) and (rm_cm != '') and (~math.isnan(rm_cm))):
+                    price = rm
+                    cm = rm_cm
+                    most_relavant = 5.0
+                else:
+                    if ((out is not None) and (out != 0) and (out != '') and (~math.isnan(out)) and (out_cm is not None) and (out_cm != 0) and (out_cm != '') and (~math.isnan(out_cm))):
+                        price = out
+                        cm = out_cm
+                        most_relavant = 8.0
+                    else:
+                        price = giv
+                        cm = cmstd
+                        most_relavant = 1.0
+                    
+        
+    return [price, cm, most_relavant]
+
+
+udf_func = udf(suggested_price_cm, ArrayType(DoubleType()))
+
+print("here")
+
+
+### return more columns for validation purposes
+### for example, return a new id for each loop to see where the flow is going for each transaction
+def recalculate(valid_price, current_cm, current_vpc, reb, frght, com, vol, full_vol, cmstd, max_price, max_cm, lens_str, last_trans_cxp):
+
+    lens_dict = {"giv_kg_eur": 1.0, "Strategic Repositioning": 2.0, "Negative Margin": 3.0, "Low CM Cut-Off": 4.0, "RM Passthrough": 5.0, "Deprioritized": 6.0, "Price is OK": 7.0, "Outlier": 8.0}
+    
+    lens = lens_dict[lens_str]
+    
+    if max_cm is None:
+        max_cm = 0.0
+    
+    target_price = valid_price
+    target_cm = current_cm
+    opp = 0.0
+    alert = 0.0
+    flow_no = 0.0
+    
+    if (valid_price is None) or (valid_price == ""):
+        flow_no = 0.0
+        target_cm = max_cm
+        target_price = target_cm + current_vpc + reb + frght + com
+        opp = 0.0
+        if lens == 2.0:
+            alert = 1.0
+            lens = 2.0
+        else:
+            alert = 0.0
+            lens = 6.0
+            
+    elif lens == 1.0:
+        if current_cm < 0:
+            flow_no = 1.1
+            target_price = valid_price + abs_p(current_cm)
+            target_cm = 0.0
+            opp = (target_price - valid_price) * full_vol
+            alert = 1.0
+            lens = 3.0
+        else:
+            flow_no = 1.2
+            target_price = valid_price
+            target_cm = current_cm
+            alert = 0.0
+            lens = 7.0
+        
+    elif lens == 3.0:
+        flow_no = 2.0
+        if current_cm > max_cm:
+            flow_no = 2.1
+            if current_cm > 0.0:
+                flow_no = 2.11
+                target_cm = current_cm
+            else:
+                flow_no = 2.12
+                target_cm = 0.0
+        else:
+            flow_no = 2.2
+            target_cm = 0.0
+        
+        target_price = target_cm + current_vpc + frght + reb + com
+        
+        opp = (target_price - valid_price) * full_vol
+        
+        if target_cm > 0.0:
+            flow_no = 2.3
+            alert = 0.0
+            lens = 7.0
+        else:
+            flow_no = 2.4
+            alert = 1.0
+            
+    elif current_cm < 0.0:
+        flow_no = 3.0
+        if lens == 2.0:
+            flow_no = 3.1
+            if max_price > valid_price:
+                flow_no = 3.11
+                target_price = max_price
+                target_cm = target_price - current_vpc - frght - reb - com
+                if target_cm < 0.0:
+                    flow_no = 3.111
+                    target_price = max_price + abs_p(target_cm)
+                    
+                target_cm = target_price - current_vpc - frght - reb - com
+                opp = (target_price - valid_price) * full_vol
+                alert = 1.0
+                lens = 3.0
+                
+            else:
+                flow_no = 3.12
+                target_cm = 0.0
+                target_price = valid_price + abs_p(current_cm)
+                opp = (target_price - valid_price) * full_vol
+                alert = 1.0
+                lens = 3.0
+        else:
+            flow_no = 3.2
+            target_cm = 0.0
+            target_price = abs_p(current_cm) + current_vpc + frght + reb + com
+            opp = (target_price - valid_price) * full_vol
+            alert = 1.0
+            lens = 3.0
+        
+    elif lens == 2.0:
+        flow_no = 4.0
+        if max_price > valid_price:
+            flow_no = 4.1
+            target_price = max_price
+        else:
+            flow_no = 4.2
+            target_price = valid_price
+            
+        target_cm = target_price - current_vpc - frght - reb - com
+        opp = (target_price - valid_price) * full_vol
+        alert = 1.0
+        lens = 2.0
+        
+        if target_cm < 0.0:
+            flow_no = 4.3
+            target_price = abs_p(target_cm) + current_vpc + frght + reb + com
+            target_cm = 0.0
+            opp = (target_price - valid_price) * full_vol
+            alert = 1.0
+            lens = 3.0
+            
+    elif current_cm == max_cm:
+        flow_no = 5.0
+        target_cm = max_cm
+        target_price = valid_price
+        opp = 0.0
+        alert = 0.0
+        lens = 7.0
+        
+    elif current_cm < max_cm:
+        flow_no = 6.0
+        target_cm = max_cm
+        
+        if (target_cm + current_vpc + frght + reb + com) >= (1.15 * (valid_price)):
+            flow_no = 5.1
+            target_price = round_p((1.15 * valid_price), 2)
+        else:
+            flow_no = 5.2
+            target_price = round_p((target_cm + current_vpc + reb + frght + com), 2)
+            
+        target_cm = target_price - current_vpc - frght - reb - com
+        opp = (target_price - valid_price) * full_vol
+        if last_trans_cxp == 'No':
+            flow_no = 5.3
+            alert = 0.0
+            
+        elif cmstd < 0.0:
+            flow_no = 5.4
+            alert = 1.0
+        elif round_p((target_price - valid_price), 2) < 0.05:
+            flow_no = 5.5
+            alert = 0.0
+            lens = 6.0
+        elif opp <= 500:
+            flow_no = 5.6
+            alert = 0.0
+            lens = 6.0
+        elif vol <= 625:
+            flow_no = 5.7
+            alert = 0.0
+            lens = 6.0
+        else:
+            flow_no = 5.8
+            alert = 1.0
+            
+        if alert == 0.0:
+            flow_no = 5.9
+            target_price = valid_price
+            target_cm = current_cm
+
+    else:
+        flow_no = 6.0
+        target_cm = current_cm
+        target_price = valid_price
+        opp = 0.0
+        alert = 0.0
+        lens = 7.0
+    
+    return [target_price, target_cm, opp, alert, lens, flow_no]
+    
+
+recal_udf = udf(recalculate, ArrayType(DoubleType()))
+
+
+print("pass")
+#check and deletes older parquet files
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_2_0_pricing_opportunities_global_unapproved/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_2_2_list_complete/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_2_3_list_complete_data_check/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "al_3_1_0_enriched_transactional_alert", additional_options = {'useS3ListImplementation': True}, transformation_ctx = "datasource01")
+price_master  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_3_7_cxp_master", additional_options = {'useS3ListImplementation': True}, transformation_ctx = "datasource02")
+cust_details = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_1_1_customer_details_mendix", additional_options = {'useS3ListImplementation': True}, transformation_ctx = "datasource5")
+cwid = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_22_mapping_sales_officers_cwid_to_email", transformation_ctx = "datasource10")
+acc_mgr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_14_mapping_accountmanager_input", transformation_ctx = "datasource8")
+
+
+bw_data_og = bw_data.toDF()
+bw_data = bw_data.toDF()
+cxp_master = price_master.toDF()
+price_master = price_master.toDF()
+cust_details = cust_details.toDF()
+cwid = cwid.toDF().selectExpr("sales_off as am_number", "sales_off_descrp as account_manager")
+
+
+cwid = cwid.withColumn("am_number", trim(cwid.am_number))
+
+
+bw_data = bw_data.drop_duplicates()
+
+bw_data = bw_data.filter(col("12_month_rolling") == "Yes")
+
+
+
+bw_data = bw_data.fillna(0, subset=['reb_kg_eur', 'frght_kg_eur', 'othvse_kg_eur'])
+
+bw_data.filter(bw_data.cust_number == '0011350953').show()
+
+bw_data = bw_data.withColumn("transaction_date", to_date(bw_data.transaction_date, "MM-dd-yyyy"))
+bw_data_og = bw_data_og.withColumn("transaction_date", to_date(bw_data_og.transaction_date, "MM-dd-yyyy"))
+
+bw_data = bw_data.withColumnRenamed("suggested_price_SRP", "suggested_price_srp")
+bw_data = bw_data.withColumnRenamed("suggested_cm_SRP", "suggested_cm_srp")
+
+bw_data = bw_data.replace(float('nan'), None, subset = ['suggested_price_srp', 'suggested_cm_srp'])
+
+bw_data = bw_data.withColumn('prod_number', lpad(bw_data.prod_number.cast(StringType()), 18, '0'))
+
+
+price_master = price_master.selectExpr("cust_number as cust_number_cxp", "prod_number as prod_number_cxp", "incoterm1", "incoterm2", "sales_org as sales_org_cxp", "scales_rate", "valid_price_base_currency", "scales_qty", "max_vol", "valid_to", "valid_from", "per", "uom as base_uom", "currency as base_currency_valid_price", "fx_rate_into_eur", "weight_rate_to_apply", "cond_type as valid_price_condition_type")
+
+price_master = price_master.join(cust_details.selectExpr("cust_number as cust_number_cxp", "cust_region as cxp_region_cxp", "ibg as ibg_cxp").drop_duplicates(), "cust_number_cxp" ,'left')
+
+
+
+price_master = price_master.withColumn("current_date", current_date())
+
+price_master = price_master.withColumn("valid_from", to_date(price_master.valid_from, "yyyy-MM-dd"))
+price_master = price_master.withColumn("valid_to", to_date(price_master.valid_to, "yyyy-MM-dd"))
+
+cxp_master = cxp_master.withColumn("valid_from", to_date(cxp_master.valid_from, "yyyy-MM-dd"))
+cxp_master = cxp_master.withColumn("valid_to", to_date(cxp_master.valid_to, "yyyy-MM-dd"))
+
+price_master = price_master.withColumn("ibg_cxp", trim(price_master.ibg_cxp))
+bw_data = bw_data.withColumn("ibg_descrp", trim(bw_data.ibg_descrp))
+
+
+price_master_curr = price_master.filter((price_master.valid_from <= price_master.current_date) & (price_master.valid_to >= price_master.current_date))
+
+price_master_curr = price_master_curr.sort(price_master_curr.cust_number_cxp, price_master_curr.prod_number_cxp, price_master_curr.sales_org_cxp, price_master_curr.incoterm1, price_master_curr.scales_qty.asc(), price_master_curr.valid_from.desc()) #.coalesce(1)
+
+price_master_curr = price_master_curr.drop_duplicates(['cust_number_cxp', 'prod_number_cxp', 'sales_org_cxp', 'incoterm1', 'scales_qty', 'max_vol'])
+
+
+
+join_cond = [(price_master_curr.cust_number_cxp == bw_data.cust_number) & (price_master_curr.prod_number_cxp == bw_data.prod_number) & (price_master_curr.sales_org_cxp == bw_data.sales_org) & ((price_master_curr.scales_qty <= bw_data.transactional_vol_kg) & (price_master_curr.max_vol >= bw_data.transactional_vol_kg))]
+
+
+### Join explodes a bit. Need to think of a solution
+bw_data = bw_data.join(price_master_curr, join_cond, 'left')
+
+
+bw_data = bw_data.sort(bw_data.max_vol.desc()) 
+
+bw_data = bw_data.drop_duplicates(['cust_number_cxp', 'prod_number_cxp', 'sales_org_cxp', 'transaction_date'])
+
+print(bw_data.count())
+
+#bw_data.show(1)
+
+del price_master_curr
+
+bw_data = bw_data.drop('cust_number_cxp', 'prod_number_cxp', 'sales_org_cxp', 'cxp_region_cxp')
+
+
+price_master_future = price_master.selectExpr("cust_number_cxp as cust_number", "prod_number_cxp as prod_number", "cxp_region_cxp as cxp_region", "sales_org_cxp as sales_org", "valid_to", "valid_from", "current_date", "scales_rate", "valid_price_base_currency")
+
+print("????")
+price_master_future = price_master_future.filter(((price_master_future.valid_from > price_master_future.current_date) & (price_master_future.valid_to > price_master_future.current_date)))
+print("\n \n ????")
+
+price_master_future = price_master_future.sort(price_master_future.valid_from.asc())  #.coalesce(1)
+
+
+price_master_future = price_master_future.drop_duplicates(["cust_number", "prod_number", "cxp_region", "sales_org"])
+price_master_future = price_master_future.withColumnRenamed("valid_from", "next_valid_from_date")
+price_master_future = price_master_future.withColumnRenamed("valid_to", "next_valid_to_date")
+price_master_future = price_master_future.withColumnRenamed("scales_rate", "next_valid_price_kg_eur")
+price_master_future = price_master_future.withColumnRenamed("valid_price_base_currency", "next_valid_price_base")
+
+
+price_master_future = price_master_future.selectExpr("cust_number", "prod_number", "cxp_region", "sales_org", "next_valid_from_date", "next_valid_to_date", "next_valid_price_kg_eur", "next_valid_price_base")
+
+
+
+bw_data = bw_data.join(price_master_future, ["cust_number", "prod_number", "cxp_region", "sales_org"], 'left')
+
+del price_master_future
+
+print(bw_data.count())
+
+bw_data = bw_data.filter(bw_data.max_vol.isNotNull())
+
+bw_data = bw_data.withColumn("am_number", element_at(split(bw_data.account_manager, " "), 1))
+bw_data = bw_data.withColumn("am_number", trim(bw_data.am_number))
+
+bw_data = bw_data.drop("account_manager")
+
+bw_data = bw_data.join(cwid, "am_number", 'left')
+
+
+# End of pipe account swap
+acc_mgr = acc_mgr.toDF().selectExpr("ml2 as ibg","customer as cust_number", "sales_org", "am_responsible", "account_manager as am_name")
+acc_mgr_cust_specic = acc_mgr
+acc_mgr_all_cust = acc_mgr.filter(acc_mgr.cust_number.isNull()).drop('cust_number')
+
+bw_data = bw_data.join(acc_mgr_cust_specic, how='left', on=['ibg', 'cust_number', 'sales_org'])
+bw_data = bw_data.withColumn("am_number", when(bw_data.am_responsible.isNull(), bw_data.am_number).otherwise(bw_data.am_responsible))
+bw_data = bw_data.withColumn("account_manager", when(bw_data.am_name.isNull(), bw_data.account_manager).otherwise(bw_data.am_name))
+bw_data = bw_data.drop("am_responsible", 'am_name')
+
+bw_data = bw_data.join(acc_mgr_all_cust, how='left', on=['ibg', 'sales_org'])
+bw_data = bw_data.withColumn("am_number", when(bw_data.am_responsible.isNull(), bw_data.am_number).otherwise(bw_data.am_responsible))
+bw_data = bw_data.withColumn("account_manager", when(bw_data.am_name.isNull(), bw_data.account_manager).otherwise(bw_data.am_name))
+bw_data = bw_data.drop("am_responsible", 'am_name')
+
+
+bw_data = bw_data.join(cust_details.select("cust_number", "cust_descrp_chi").drop_duplicates(), "cust_number", 'left')
+
+
+
+print("\n 1 \n")
+
+print("\n VOLUMEEEE \n ")
+
+bw_data_full_year = bw_data.groupBy("cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg").agg(sum("transactional_vol_kg").alias("last_12_month_volume"))
+
+print("\n 2 \n")
+
+
+print("\n 3 \n")
+    
+bw_data_full_year = bw_data_full_year.select("cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg", "last_12_month_volume")
+
+bw_data = bw_data.join(bw_data_full_year, ["cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg"], 'left')
+
+bw_data = bw_data.withColumn("last_12_month_volume", when((isnan(bw_data.last_12_month_volume) | (bw_data.last_12_month_volume.isNull())), 0.0).otherwise(bw_data.last_12_month_volume) )
+#bw_data.show(1)
+
+del bw_data_full_year
+
+##fill nans with 0
+
+print("\n 3 \n")
+
+bw_data = bw_data.withColumn("base_last_12_month_volume", bw_data.last_12_month_volume / (bw_data.weight_rate_to_apply)) 
+
+
+if datetime.now().month == 1:
+    bw_data_ytd = bw_data.filter(bw_data.fiscal_year == (year(current_date()) - 1))
+else:
+    bw_data_ytd = bw_data.filter(bw_data.fiscal_year == year(current_date()))
+    bw_data_ytd = bw_data_ytd.filter(bw_data_ytd.month <= month(current_date()))
+
+print("\n 4 \n")
+
+
+bw_data_ytd = bw_data_ytd.groupBy("cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg").agg(sum("transactional_vol_kg").alias("ytd_volume"))
+
+#bw_data_ytd.groupBy("ytd_volume").count().show()
+
+bw_data_ytd = bw_data_ytd.select("cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg", "ytd_volume")
+
+print("\n 5 \n")
+
+bw_data = bw_data.join(bw_data_ytd, ["cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg"], 'left')
+
+bw_data = bw_data.withColumn("ytd_volume", when((isnan(bw_data.ytd_volume) | (bw_data.ytd_volume.isNull())), 0.0).otherwise(bw_data.ytd_volume) )
+bw_data.show(1)
+
+del bw_data_ytd
+
+bw_data = bw_data.withColumn("base_ytd_volume", bw_data.ytd_volume / (bw_data.weight_rate_to_apply)) 
+
+##fill nans with 0
+
+
+### LAST TRANSACTION PER CXP --> Remove IBG from groupby and keys for now. main fix in 2.7 work flow
+### main fix i 2.7, addng IBG again
+
+bw_data_last_transaction = bw_data.groupBy("cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg").agg(max("transaction_date").alias("last_transaction"))
+
+print("\n 6 \n")
+
+#bw_data_last_transaction = bw_data_last_transaction.withColumn("last_transaction", to_date(bw_data_last_price.last_transaction, "dd-MM-yyyy"))
+
+print("\n 7 \n")
+
+bw_data_last_transaction = bw_data_last_transaction.selectExpr("cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg", "last_transaction as transaction_date")
+
+print("\n 8 \n")
+
+bw_data_last_transaction = bw_data_last_transaction.withColumn("last_transaction_per_cxp", lit("Yes"))
+
+bw_data = bw_data.join(bw_data_last_transaction, ["cust_number", "prod_number", "cxp_region", "sales_org", "bu", "ibg", "transaction_date"], 'left')
+
+print("\n 9 \n")
+
+bw_data = bw_data.fillna("No", subset=['last_transaction_per_cxp'])
+
+
+
+
+del bw_data_last_transaction
+
+bw_data = bw_data.withColumn("max_suggested_price", udf_func(bw_data.suggested_price_srp,bw_data.suggested_cm_srp, bw_data.suggested_price_negative_margin,bw_data.suggested_cm_negative_margin,bw_data.suggested_price_low_cutoff,bw_data.suggested_cm_low_cutoff,bw_data.suggested_price_rm_passthrough,bw_data.suggested_cm_rm_passthrough, bw_data.suggested_price_outlier, bw_data.suggested_cm_outlier, bw_data.giv_kg_eur, bw_data.cmstd_kg_eur)[0]) 
+bw_data = bw_data.withColumn("max_suggested_cm", udf_func(bw_data.suggested_price_srp,bw_data.suggested_cm_srp,bw_data.suggested_price_negative_margin,bw_data.suggested_cm_negative_margin,bw_data.suggested_price_low_cutoff,bw_data.suggested_cm_low_cutoff,bw_data.suggested_price_rm_passthrough,bw_data.suggested_cm_rm_passthrough, bw_data.suggested_price_outlier, bw_data.suggested_cm_outlier, bw_data.giv_kg_eur, bw_data.cmstd_kg_eur)[1]) 
+bw_data = bw_data.withColumn("most_relevant", udf_func(bw_data.suggested_price_srp,bw_data.suggested_cm_srp,bw_data.suggested_price_negative_margin,bw_data.suggested_cm_negative_margin,bw_data.suggested_price_low_cutoff,bw_data.suggested_cm_low_cutoff,bw_data.suggested_price_rm_passthrough,bw_data.suggested_cm_rm_passthrough, bw_data.suggested_price_outlier, bw_data.suggested_cm_outlier, bw_data.giv_kg_eur, bw_data.cmstd_kg_eur)[2]) 
+
+#bw_data.select("most_relevant").distinct().show()
+
+bw_data = bw_data.withColumnRenamed("scales_rate", "valid_price_kg_eur")
+
+bw_data = bw_data.withColumn("current_cm_kg_eur", (bw_data.valid_price_kg_eur - bw_data.current_vpc_kg_eur - bw_data.reb_kg_eur - bw_data.frght_kg_eur - bw_data.othvse_kg_eur))
+
+'''
+bw_data = bw_data.fillna(0, subset=['valid_price_kg_eur', 'current_vpc_kg_eur', 'current_cm_kg_eur', 'reb_kg_eur', 'frght_kg_eur', 'othvse_kg_eur', 'transactional_vol_kg', 'cmstd_kg_eur', 'max_suggested_price', 'max_suggested_cm'])
+
+bw_data = bw_data.withColumn("current_cm_kg_eur", when(isnan(bw_data.current_cm_kg_eur), 0).otherwise(bw_data.current_cm_kg_eur))
+bw_data = bw_data.withColumn("valid_price_kg_eur", when(isnan(bw_data.valid_price_kg_eur), 0).otherwise(bw_data.valid_price_kg_eur))
+bw_data = bw_data.withColumn("current_vpc_kg_eur", when(isnan(bw_data.current_vpc_kg_eur), 0).otherwise(bw_data.current_vpc_kg_eur))
+bw_data = bw_data.withColumn("reb_kg_eur", when(isnan(bw_data.reb_kg_eur), 0).otherwise(bw_data.reb_kg_eur))
+bw_data = bw_data.withColumn("frght_kg_eur", when(isnan(bw_data.frght_kg_eur), 0).otherwise(bw_data.frght_kg_eur))
+bw_data = bw_data.withColumn("othvse_kg_eur", when(isnan(bw_data.othvse_kg_eur), 0).otherwise(bw_data.othvse_kg_eur))
+bw_data = bw_data.withColumn("transactional_vol_kg", when(isnan(bw_data.transactional_vol_kg), 0).otherwise(bw_data.transactional_vol_kg))
+bw_data = bw_data.withColumn("cmstd_kg_eur", when(isnan(bw_data.cmstd_kg_eur), 0).otherwise(bw_data.cmstd_kg_eur))
+'''
+
+bw_data = bw_data.withColumn("most_relevant", when(bw_data.most_relevant == 2.0, "Strategic Repositioning").when(bw_data.most_relevant == 3.0, "Negative Margin").when(bw_data.most_relevant == 4.0, "Low CM Cut-Off").when(bw_data.most_relevant == 5.0, "RM Passthrough").when(bw_data.most_relevant == 8.0, "Outlier").when(bw_data.most_relevant == 1.0, "giv_kg_eur").otherwise("giv_kg_eur"))
+
+bw_data = bw_data.withColumn("suggested_price_kg_eur", recal_udf(bw_data.valid_price_kg_eur, bw_data.current_cm_kg_eur, bw_data.current_vpc_kg_eur, bw_data.reb_kg_eur, bw_data.frght_kg_eur, bw_data.othvse_kg_eur, bw_data.transactional_vol_kg, bw_data.last_12_month_volume, bw_data.cmstd_kg_eur, bw_data.max_suggested_price, bw_data.max_suggested_cm, bw_data.most_relevant, bw_data.last_transaction_per_cxp)[0])
+bw_data = bw_data.withColumn("suggested_cm_kg_eur", recal_udf(bw_data.valid_price_kg_eur, bw_data.current_cm_kg_eur, bw_data.current_vpc_kg_eur, bw_data.reb_kg_eur, bw_data.frght_kg_eur, bw_data.othvse_kg_eur, bw_data.transactional_vol_kg, bw_data.last_12_month_volume, bw_data.cmstd_kg_eur, bw_data.max_suggested_price, bw_data.max_suggested_cm, bw_data.most_relevant, bw_data.last_transaction_per_cxp)[1])
+bw_data = bw_data.withColumn("opportunity_value_eur", recal_udf(bw_data.valid_price_kg_eur, bw_data.current_cm_kg_eur, bw_data.current_vpc_kg_eur, bw_data.reb_kg_eur, bw_data.frght_kg_eur, bw_data.othvse_kg_eur, bw_data.transactional_vol_kg, bw_data.last_12_month_volume, bw_data.cmstd_kg_eur, bw_data.max_suggested_price, bw_data.max_suggested_cm, bw_data.most_relevant, bw_data.last_transaction_per_cxp)[2])
+bw_data = bw_data.withColumn("alert", recal_udf(bw_data.valid_price_kg_eur, bw_data.current_cm_kg_eur, bw_data.current_vpc_kg_eur, bw_data.reb_kg_eur, bw_data.frght_kg_eur, bw_data.othvse_kg_eur, bw_data.transactional_vol_kg, bw_data.last_12_month_volume, bw_data.cmstd_kg_eur, bw_data.max_suggested_price, bw_data.max_suggested_cm, bw_data.most_relevant, bw_data.last_transaction_per_cxp)[3])
+bw_data = bw_data.withColumn("most_relevant_lens", recal_udf(bw_data.valid_price_kg_eur, bw_data.current_cm_kg_eur, bw_data.current_vpc_kg_eur, bw_data.reb_kg_eur, bw_data.frght_kg_eur, bw_data.othvse_kg_eur, bw_data.transactional_vol_kg, bw_data.last_12_month_volume, bw_data.cmstd_kg_eur, bw_data.max_suggested_price, bw_data.max_suggested_cm, bw_data.most_relevant, bw_data.last_transaction_per_cxp)[4])
+bw_data = bw_data.withColumn("flow_no", recal_udf(bw_data.valid_price_kg_eur, bw_data.current_cm_kg_eur, bw_data.current_vpc_kg_eur, bw_data.reb_kg_eur, bw_data.frght_kg_eur, bw_data.othvse_kg_eur, bw_data.transactional_vol_kg, bw_data.last_12_month_volume, bw_data.cmstd_kg_eur, bw_data.max_suggested_price, bw_data.max_suggested_cm, bw_data.most_relevant, bw_data.last_transaction_per_cxp)[5])
+
+
+
+def get_lens(lens):
+    
+    lens_dict = {1.0: "giv_kg_eur", 2.0: "Strategic Repositioning", 3.0: "Negative Margin", 4.0: "Low CM Cut-Off", 5.0: "RM Passthrough", 6.0: "Deprioritized", 7.0: "Price is OK", 8.0: "Outlier"}
+    return lens_dict.get(lens, "Price is OK")
+    
+def get_alert(al):
+    
+    alert_dict = {0.0: "No", 1.0: "Yes"}
+
+    return alert_dict.get(al, "No")
+    
+udf_lens = udf(get_lens, StringType())
+udf_alert = udf(get_alert, StringType())
+
+
+bw_data = bw_data.withColumn("alert", udf_alert(bw_data.alert))
+bw_data = bw_data.withColumn("most_relevant_final", udf_lens(bw_data.most_relevant_lens))
+
+
+bw_data = bw_data.withColumn("alert", when(((bw_data.last_transaction_per_cxp == "Yes") & (bw_data.suggested_cm_kg_eur < 0)), "Yes").otherwise(bw_data.alert))
+bw_data = bw_data.withColumn("most_relevant_final", when(((bw_data.last_transaction_per_cxp == "Yes") & (bw_data.suggested_cm_kg_eur < 0)), "Negative Margin").otherwise(bw_data.most_relevant_final) )
+bw_data = bw_data.withColumn("suggested_price_kg_eur", when(((bw_data.last_transaction_per_cxp == "Yes") & (bw_data.suggested_cm_kg_eur < 0)), bw_data.suggested_price_kg_eur + abs(bw_data.suggested_cm_kg_eur)).otherwise(bw_data.suggested_price_kg_eur))
+bw_data = bw_data.withColumn("opportunity_value_eur", when(((bw_data.last_transaction_per_cxp == "Yes") & (bw_data.suggested_cm_kg_eur < 0)), bw_data.opportunity_value_eur + (abs(bw_data.suggested_cm_kg_eur) * bw_data.transactional_vol_kg) ).otherwise(bw_data.opportunity_value_eur))
+bw_data = bw_data.withColumn("suggested_cm_kg_eur", when(((bw_data.last_transaction_per_cxp == "Yes") & (bw_data.suggested_cm_kg_eur < 0)), 0.0).otherwise(bw_data.suggested_cm_kg_eur))
+
+
+
+#bw_data.select("most_relevant_final").distinct().show()
+
+bw_data = bw_data.withColumn("cm_total_at_transaction_eur", bw_data.cmstd_kg_eur * bw_data.transactional_vol_kg)
+
+bw_data = bw_data.withColumn("opportunity_value_base", bw_data.opportunity_value_eur / (bw_data.fx_rate_into_eur))
+
+bw_data = bw_data.withColumn("current_cm_base_currency_uom", bw_data.current_cm_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur))
+bw_data = bw_data.withColumn("current_cost_base_currency_uom", bw_data.current_vpc_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+
+bw_data = bw_data.withColumn("suggested_cost_kg_eur", bw_data.current_vpc_kg_eur  + bw_data.frght_kg_eur + bw_data.reb_kg_eur + bw_data.othvse_kg_eur)
+bw_data = bw_data.withColumn("suggested_cost_base_currency_uom", bw_data.suggested_cost_kg_eur  * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur))
+
+bw_data = bw_data.withColumn("suggested_price_base", bw_data.suggested_price_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("suggested_cm_base", bw_data.suggested_cm_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+
+
+#bw_data = bw_data.withColumn("valid_price_base_currency", bw_data.valid_price_kg_eur / (bw_data.fx_rate_into_eur * bw_data.weight_rate_to_apply))
+bw_data = bw_data.withColumn("giv_base", bw_data.giv_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur))
+bw_data = bw_data.withColumn("nsv_base", bw_data.nsv_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("vpc_base", bw_data.vpc_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("frght_base", bw_data.frght_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("reb_base", bw_data.reb_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("othvse_base", bw_data.othvse_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("cmstd_base", bw_data.cmstd_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("transactional_vol_base", bw_data.transactional_vol_kg / (bw_data.weight_rate_to_apply))
+bw_data = bw_data.withColumn("current_vpc_base", bw_data.current_vpc_kg_eur * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+
+bw_data = bw_data.withColumn("suggested_price_negative_margin_base", bw_data.suggested_price_negative_margin * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("suggested_cm_negative_margin_base", bw_data.suggested_cm_negative_margin  * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur))
+
+bw_data = bw_data.withColumn("suggested_cm_low_cutoff_base", bw_data.suggested_cm_low_cutoff * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("suggested_price_low_cutoff_base", bw_data.suggested_price_low_cutoff * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+
+bw_data = bw_data.withColumn("suggested_cm_rm_passthrough_base", bw_data.suggested_cm_rm_passthrough  * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur))
+bw_data = bw_data.withColumn("suggested_price_rm_passthrough_base", bw_data.suggested_price_rm_passthrough * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur ))
+
+bw_data = bw_data.withColumn("suggested_price_srp_base", bw_data.suggested_price_srp * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("suggested_cm_srp_base", bw_data.suggested_cm_srp * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur))
+
+bw_data = bw_data.withColumn("suggested_price_outlier_base", bw_data.suggested_price_outlier * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur ))
+bw_data = bw_data.withColumn("suggested_cm_outlier_base", bw_data.suggested_cm_outlier * bw_data.weight_rate_to_apply / (bw_data.fx_rate_into_eur))
+
+
+bw_data = bw_data.withColumn("upload_date", current_timestamp())
+bw_data = bw_data.withColumn("source_system", lit("enriched_transactional_alert")) #same as title
+
+
+bw_data = bw_data.drop("most_relevant", "most_relevant_lens")
+bw_data = bw_data.withColumnRenamed("most_relevant_final", "most_relevant")
+
+
+### DATE OF LAST PRICE CHANGE
+
+bw_data_last_price = bw_data_og.select("prod_number", "transaction_date")
+
+#bw_data_last_price = bw_data_last_price.withColumn("transaction_date", to_date(bw_data_last_price.transaction_date, "MM-dd-yyyy"))
+
+bw_data_last_price = bw_data_last_price.withColumn("date_of_last_price_change", bw_data_last_price.transaction_date)
+
+
+cxp_master_last_price = cxp_master.selectExpr("prod_number as prod_number_cxp", "valid_from")
+
+
+
+join_cond = [(bw_data_last_price.prod_number == cxp_master_last_price.prod_number_cxp) & (bw_data_last_price.transaction_date < cxp_master_last_price.valid_from)]
+
+cxp_master_last_price = cxp_master_last_price.join(bw_data_last_price, join_cond ,'left')
+
+print("\n 10 \n")
+
+print("hmm3")
+cxp_master_last_price = cxp_master_last_price.selectExpr("prod_number", "valid_from", "date_of_last_price_change")
+
+cxp_master_last_price = cxp_master_last_price.sort(cxp_master_last_price.date_of_last_price_change.desc()) #.coalesce(1)
+cxp_master_last_price = cxp_master_last_price.drop_duplicates(["prod_number", "valid_from"]).select("prod_number", "valid_from", "date_of_last_price_change")
+
+bw_data = bw_data.withColumn("valid_from", to_date(bw_data.valid_from, "yyyy-MM-dd"))  ############
+
+bw_data = bw_data.join(cxp_master_last_price, ["prod_number", "valid_from"], 'left')
+
+
+bw_data_last_price = bw_data_og.selectExpr("prod_number as prod_number_bw", "transaction_date", "vpc_kg_eur")
+
+
+
+del cxp_master_last_price
+
+#bw_data_last_price = bw_data_last_price.withColumn("transaction_date", to_date(bw_data_last_price.transaction_date, "MM-dd-yyyy"))
+
+del bw_data_og
+
+bw_data_last_price = bw_data_last_price.groupBy("prod_number_bw", "transaction_date").agg(mean("vpc_kg_eur").alias("vpc_at_last_price_change"))
+
+bw_data_last_price = bw_data_last_price.selectExpr("prod_number_bw", "transaction_date as transaction_date_bw", "vpc_at_last_price_change")
+
+join_cond = [(bw_data.prod_number == bw_data_last_price.prod_number_bw) & (bw_data.date_of_last_price_change == bw_data_last_price.transaction_date_bw)]
+
+
+bw_data = bw_data.join(bw_data_last_price, join_cond ,'left')
+
+
+bw_data = bw_data.drop("prod_number_bw", "transaction_date_bw")
+
+bw_data.show(1)
+
+bw_data = bw_data.withColumnRenamed("valid_from", "valid_from_date")
+bw_data = bw_data.withColumnRenamed("valid_to", "valid_to_date")
+bw_data = bw_data.withColumn("suggested_costs", bw_data.current_vpc_kg_eur + bw_data.frght_kg_eur + bw_data.reb_kg_eur + bw_data.othvse_kg_eur) 
+
+bw_data_last_price = bw_data.select("cust_number", "prod_number", "ibg", "country_soldto", "cxp_region", "sales_org", "transaction_date", "reb_kg_eur", "frght_kg_eur", "othvse_kg_eur")
+
+bw_data_last_price = bw_data_last_price.withColumn('frght_kg_eur', when((isnan(bw_data_last_price.frght_kg_eur) | bw_data_last_price.frght_kg_eur.isNull()), 0.0).otherwise(bw_data_last_price.frght_kg_eur))
+bw_data_last_price = bw_data_last_price.withColumn('reb_kg_eur', when((isnan(bw_data_last_price.reb_kg_eur) | bw_data_last_price.reb_kg_eur.isNull()), 0.0).otherwise(bw_data_last_price.reb_kg_eur))
+bw_data_last_price = bw_data_last_price.withColumn('othvse_kg_eur', when((isnan(bw_data_last_price.othvse_kg_eur) | bw_data_last_price.othvse_kg_eur.isNull()), 0.0).otherwise(bw_data_last_price.othvse_kg_eur))
+
+bw_data_last_price1 = bw_data_last_price.groupBy("cust_number", "prod_number", "cxp_region", "sales_org", "transaction_date").agg(mean("reb_kg_eur").alias("avg_reb_kg_eur1"), mean("frght_kg_eur").alias("avg_frght_kg_eur1"), mean("othvse_kg_eur").alias("avg_othvse_kg_eur1"))
+
+bw_data_last_price1 = bw_data_last_price1.withColumnRenamed("transaction_date", "date_of_last_price_change")
+
+print(bw_data_last_price1.columns)
+
+bw_data_last_price1 = bw_data_last_price1.select("cust_number", "prod_number", "cxp_region", "sales_org", "date_of_last_price_change", "avg_reb_kg_eur1", "avg_frght_kg_eur1", "avg_othvse_kg_eur1")
+
+print("??????")
+bw_data = bw_data.join(bw_data_last_price1, ["cust_number", "prod_number", "cxp_region", "sales_org", "date_of_last_price_change"] ,'left')
+
+
+
+
+del bw_data_last_price1
+
+bw_data_last_price2 = bw_data_last_price.groupBy("cust_number", "cxp_region", "sales_org", "transaction_date").agg(mean("reb_kg_eur").alias("avg_reb_kg_eur2"), mean("frght_kg_eur").alias("avg_frght_kg_eur2"), mean("othvse_kg_eur").alias("avg_othvse_kg_eur2"))
+bw_data_last_price2 = bw_data_last_price2.withColumnRenamed("transaction_date", "date_of_last_price_change")
+bw_data_last_price2 = bw_data_last_price2.select("cust_number", "cxp_region", "sales_org", "date_of_last_price_change", "avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2")
+
+bw_data = bw_data.join(bw_data_last_price2, ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change"] ,'left')
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_kg_eur1) | bw_data.avg_frght_kg_eur1.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_kg_eur1)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_kg_eur1) | bw_data.avg_reb_kg_eur1.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_kg_eur1)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_othvse_kg_eur1) | bw_data.avg_othvse_kg_eur1.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_othvse_kg_eur1)) 
+
+
+bw_data = bw_data.drop("avg_reb_kg_eur1", "avg_frght_kg_eur1", "avg_othvse_kg_eur1", "avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2")
+
+bw_data = bw_data.withColumn("date_of_last_price_change1", add_months(bw_data.date_of_last_price_change, -1))
+bw_data = bw_data.withColumn("date_of_last_price_change2", add_months(bw_data.date_of_last_price_change, -2))
+bw_data = bw_data.withColumn("date_of_last_price_change3", add_months(bw_data.date_of_last_price_change, -3))
+bw_data = bw_data.withColumn("date_of_last_price_change4", add_months(bw_data.date_of_last_price_change, -4))
+bw_data = bw_data.withColumn("date_of_last_price_change5", add_months(bw_data.date_of_last_price_change, -5))
+bw_data = bw_data.withColumn("date_of_last_price_change6", add_months(bw_data.date_of_last_price_change, -6))
+bw_data = bw_data.withColumn("date_of_last_price_change7", add_months(bw_data.date_of_last_price_change, -7))
+bw_data = bw_data.withColumn("date_of_last_price_change8", add_months(bw_data.date_of_last_price_change, -8))
+bw_data = bw_data.withColumn("date_of_last_price_change9", add_months(bw_data.date_of_last_price_change, -9))
+bw_data = bw_data.withColumn("date_of_last_price_change10", add_months(bw_data.date_of_last_price_change, -10))
+bw_data = bw_data.withColumn("date_of_last_price_change11", add_months(bw_data.date_of_last_price_change, -11))
+
+bw_data = bw_data.drop_duplicates()
+
+bw_data.show(1)
+
+
+## 1
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change1"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change1"] ,'left')
+print("\n MONTH - 1 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change1")
+
+## 2
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change2"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change2"] ,'left')
+print("\n MONTH - 2 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change2")
+
+## 3
+
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change3"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change3"] ,'left')
+print("\n MONTH - 3 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change3")
+
+
+## 4 
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change4"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change4"] ,'left')
+print("\n MONTH - 4 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change4")
+
+## 5
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change5"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change5"] ,'left')
+print("\n MONTH - 5 \n")
+#bw_data.show(1)
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change5")
+
+## 6
+
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change6"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change6"] ,'left')
+print("\n MONTH - 6 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change6")
+
+bw_data.show(1)
+## 7 
+
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change7"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change7"] ,'left')
+print("\n MONTH - 7 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change7")
+
+## 8
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change8"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change8"] ,'left')
+print("\n MONTH - 8 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change8")
+
+bw_data = bw_data.drop_duplicates()
+
+## 9
+
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change9"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change9"] ,'left')
+print("\n MONTH - 9 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change9")
+
+
+
+##10
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change10"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change10"] ,'left')
+print("\n MONTH - 10 \n")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change10")
+
+
+## 11
+
+bw_data = bw_data.join(bw_data_last_price2.withColumnRenamed("date_of_last_price_change", "date_of_last_price_change11"), ["cust_number", "cxp_region", "sales_org", "date_of_last_price_change11"] ,'left')
+print("\n MONTH - 11 \n")
+
+del bw_data_last_price2
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', when((isnan(bw_data.avg_frght_last_change_kg_eur) | bw_data.avg_frght_last_change_kg_eur.isNull()), bw_data.avg_frght_kg_eur2).otherwise(bw_data.avg_frght_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', when((isnan(bw_data.avg_reb_last_change_kg_eur) | bw_data.avg_reb_last_change_kg_eur.isNull()), bw_data.avg_reb_kg_eur2).otherwise(bw_data.avg_reb_last_change_kg_eur)) 
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', when((isnan(bw_data.avg_com_last_change_kg_eur) | bw_data.avg_com_last_change_kg_eur.isNull()), bw_data.avg_othvse_kg_eur2).otherwise(bw_data.avg_com_last_change_kg_eur)) 
+
+bw_data = bw_data.drop("avg_reb_kg_eur2", "avg_frght_kg_eur2", "avg_othvse_kg_eur2", "date_of_last_price_change11")
+
+bw_data = bw_data.withColumn('avg_frght_last_change_kg_eur', bw_data.avg_frght_last_change_kg_eur * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur )) 
+bw_data = bw_data.withColumn('avg_reb_last_change_kg_eur', bw_data.avg_reb_last_change_kg_eur * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur))
+bw_data = bw_data.withColumn('avg_com_last_change_kg_eur', bw_data.avg_com_last_change_kg_eur * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur)) 
+
+bw_data = bw_data.withColumnRenamed('avg_frght_last_change_kg_eur', 'freight_at_last_price_change_kg_eur')
+bw_data = bw_data.withColumnRenamed('avg_reb_last_change_kg_eur', 'rebate_at_last_price_change_kg_eur')
+bw_data = bw_data.withColumnRenamed('avg_com_last_change_kg_eur', 'commission_at_last_price_change_kg_eur')  
+
+bw_data = bw_data.withColumn('freight_at_last_price_change', bw_data.freight_at_last_price_change_kg_eur * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur))
+bw_data = bw_data.withColumn('rebate_at_last_price_change', bw_data.rebate_at_last_price_change_kg_eur * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur )) 
+bw_data = bw_data.withColumn('commission_at_last_price_change', bw_data.commission_at_last_price_change_kg_eur * bw_data.weight_rate_to_apply/ (bw_data.fx_rate_into_eur)) 
+
+bw_data.show(1)
+
+#bw_data_df = DynamicFrame.fromDF(bw_data, glueContext, "bw_data_df")
+
+#datasink4 = glueContext.write_dynamic_frame.from_options(frame = bw_data_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_2_list_complete_inter"}, format = "parquet", transformation_ctx = "datasink4")
+
+#job.commit()
+print("????")
+
+max_date = bw_data.select("transaction_date").toPandas()['transaction_date'].max()
+
+#max_date = bw_data.select("transaction_date").agg({"transaction_date": "max"}).collect()[0][0]
+
+bw_data = bw_data.withColumn('vpc_at_last_price_change', round(bw_data.vpc_at_last_price_change, 2))
+
+
+print("!!!")
+bw_data = bw_data.withColumn('date_of_generation', lit(max_date)) 
+#bw_data = bw_data.withColumn('date_of_generation', to_date(bw_data.date_of_generation, "MM-dd-yyyy")) 
+bw_data = bw_data.withColumn('date_of_generation', add_months(bw_data.date_of_generation, 1)) 
+
+print("PASSSSSS")
+
+bw_data = bw_data.withColumn("unique_id", monotonically_increasing_id())
+
+print("\n LIST COMPLETE \n")
+
+list_complete = bw_data.selectExpr("unique_id","cust_number","prod_number","cxp_region","bu","ibg","account_manager","transaction_date","cust_descrp","cust_descrp_chi","cust_grp","cust_grp_adj","cust_segment","cust_classification", \
+                                    "country_soldto","country_grp","prod_descrp","prod_grp","pfam","pfam_descrp","pline","pline_descrp","prod_chemistry", \
+                                    "prod_type","market_segment","market_segment_descrp","sub_market_segment", "bu_scope","ibg_descrp","am_number", \
+                                    "valid_price_condition_type as condition_type","sales_org","sales_org_descrp","plant","plant_descrp","fiscal_year","month","last_transaction_per_cxp", \
+                                    "48_month_rolling","12_month_rolling","transactional_vol_base", "cmstd_eur", \
+                                    "giv_base","nsv_base","vpc_base","frght_base","base_currency_valid_price as base_currency","base_uom as base_unit", \
+                                    "reb_base","othvse_base","cmstd_base","freight_at_last_price_change","rebate_at_last_price_change","commission_at_last_price_change","incoterm1", \
+                                    "incoterm2","scales_qty","valid_price_kg_eur","valid_price_base_currency","valid_from_date as valid_from","valid_to_date as valid_to","current_vpc_base", \
+                                    "current_cm_base_currency_uom","next_valid_price_kg_eur","next_valid_price_base","next_valid_from_date","next_valid_to_date", \
+                                    "giv_kg_eur","nsv_kg_eur","vpc_kg_eur","frght_kg_eur","reb_kg_eur","othvse_kg_eur","cmstd_kg_eur", \
+                                    "transactional_vol_kg","current_vpc_kg_eur","current_cm_kg_eur", \
+                                    "suggested_price_negative_margin","suggested_cm_negative_margin","suggested_price_low_cutoff","suggested_cm_low_cutoff","suggested_price_rm_passthrough", \
+                                    "suggested_cm_rm_passthrough","suggested_price_srp","suggested_cm_srp", "suggested_price_outlier","suggested_cm_outlier","suggested_price_negative_margin_base","suggested_cm_negative_margin_base", \
+                                    "suggested_price_low_cutoff_base","suggested_cm_low_cutoff_base","suggested_price_rm_passthrough_base","suggested_cm_rm_passthrough_base", \
+                                    "suggested_price_srp_base","suggested_cm_srp_base","suggested_price_outlier_base","suggested_cm_outlier_base","max_suggested_price","max_suggested_cm","most_relevant", "alert", "suggested_price_kg_eur","suggested_cm_kg_eur","opportunity_value_eur","flow_no", \
+                                    "suggested_cost_kg_eur","suggested_price_base","suggested_cm_base","suggested_cost_base_currency_uom","opportunity_value_base", "current_cost_base_currency_uom",\
+                                    "last_12_month_volume","base_last_12_month_volume","ytd_volume","base_ytd_volume","fx_rate_into_eur","cm_total_at_transaction_eur","weight_rate_to_apply", \
+                                    "per","date_of_last_price_change","vpc_at_last_price_change","date_of_generation","upload_date","source_system")
+
+
+bw_data_df = DynamicFrame.fromDF(list_complete, glueContext, "bw_data_df")
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = bw_data_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_2_list_complete"}, format = "parquet", transformation_ctx = "datasink4")
+
+del bw_data
+
+print("OPPORTUNITY")
+
+bw_data_opp = list_complete.filter(list_complete.last_transaction_per_cxp == "Yes")
+
+bw_data_opp = bw_data_opp.fillna("BLANK", subset=['incoterm2'])
+
+
+#bw_data_opp = bw_data_opp.withColumn("incoterm2", when((isnan(bw_data_opp.incoterm2) | (bw_data_opp.incoterm2.isNull())), 0.0).otherwise(bw_data_opp.incoterm2) )
+
+bw_data_opp = bw_data_opp.selectExpr("unique_id","account_manager","am_number","cust_number","cust_descrp","cust_descrp_chi","cust_grp_adj","cust_classification","prod_number", \
+                             "prod_descrp","pfam","pfam_descrp","pline","pline_descrp","prod_type","prod_grp","cxp_region","sales_org","plant","ibg","last_12_month_volume", \
+                             "base_last_12_month_volume","ytd_volume","base_ytd_volume","valid_from as valid_from_date","valid_to as valid_to_date","next_valid_price_kg_eur","next_valid_price_base", \
+                             "next_valid_from_date","next_valid_to_date","condition_type as valid_price_condition_type","alert","most_relevant as most_relevent","current_cm_base_currency_uom","current_cost_base_currency_uom", \
+                             "valid_price_base_currency","base_currency","base_unit","fx_rate_into_eur as exchange_rate","suggested_price_base","suggested_cm_base","suggested_cost_base_currency_uom","opportunity_value_base",\
+                             "date_of_last_price_change","vpc_at_last_price_change","incoterm1","incoterm2","current_vpc_base","frght_base as freight_base","reb_base as rebate_base","othvse_base as commission_base","freight_at_last_price_change", \
+                             "rebate_at_last_price_change","commission_at_last_price_change","upload_date","source_system")
+                             
+
+
+bw_data_opp_df = DynamicFrame.fromDF(bw_data_opp, glueContext, "bw_data_df")
+
+datasink1 = glueContext.write_dynamic_frame.from_options(frame = bw_data_opp_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_0_pricing_opportunities_global_unapproved"}, format = "parquet", transformation_ctx = "datasink1")
+######## AFTER CREATING LAST LIST COMPLETE - CREATE 3.2.4
+
+
+# TWO OPTIONS, CHECK WHICH ONE WORKS
+##last_12_month_sales_without_valid_price = list_complete.filter(list_complete.valid_price_base_currency.isNull())
+##last_12_month_sales_without_valid_price = list_complete.filter(isnan(list_complete.valid_price_base_currency))
+
+##last_12_month_sales_without_valid_price_df = DynamicFrame.fromDF(last_12_month_sales_without_valid_price, glueContext, "last_12_month_sales_without_valid_price_df")
+
+##datasink5 = glueContext.write_dynamic_frame.from_options(frame = last_12_month_sales_without_valid_price_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_4_last_12_month_sales_without_valid_price_df"}, format = "parquet", transformation_ctx = "datasink5")
+
+job.commit()
+
+"""
+
+bw_data_opp = bw_data.filter(bw_data.last_transaction_per_cxp == "Yes")
+bw_data_opp = bw_data_opp.selectExpr("unique_id","account_manager","am_number","cust_number","cust_descrp","cust_descrp_chi","cust_grp_adj","cust_classification","prod_number", \
+                             "prod_descrp","pfam","pfam_descrp","pline","pline_descrp","prod_type","prod_grp","cxp_region","sales_org","plant","ibg","last_12_month_volume", \
+                             "base_last_12_month_volume","ytd_volume","base_ytd_volume","valid_from_date","valid_to_date","next_valid_price_kg_eur","next_valid_price_base", \
+                             "next_valid_from_date","next_valid_to_date","valid_price_condition_type","alert","most_relevant as most_relevent","current_cm_base_currency_uom","current_cost_base_currency_uom", \
+                             "valid_price_base_currency","base_currency","base_uom as base_unit","fx_rate_into_eur as exchange_rate","suggested_price_base","suggested_cm_base","suggested_cost_base_currency_uom","opportunity_value_base",\
+                             "date_of_last_price_change","vpc_at_last_price_change","incoterm1","incoterm2","current_vpc_base","frght_base as freight_base","reb_base as rebate_base","othvse_base as commission_base","freight_at_last_price_change", \
+                             "rebate_at_last_price_change","commission_at_last_price_change","upload_date","source_system")
+                             
+
+
+bw_data_opp_df = DynamicFrame.fromDF(bw_data_opp, glueContext, "bw_data_df")
+
+datasink1 = glueContext.write_dynamic_frame.from_options(frame = bw_data_opp_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_0_pricing_opportunities_global"}, format = "parquet", transformation_ctx = "datasink1")
+
+job.commit()
+
+
+#create data check list complete
+list_data_check = list_complete.filter((list_complete.vpc_kg_eur.isNull()) |
+                               (list_complete.valid_price_kg_eur.isNull()) |
+                               (list_complete.valid_price_kg_eur < 0) |
+                               (list_complete.sales_org.isNull()) |
+                               (list_complete.last_transaction_per_cxp.isNull()) |
+                               (isnan(list_complete.last_transaction_per_cxp)) |
+                               (isnan(list_complete.max_suggested_price)) | 
+                               (list_complete.max_suggested_price.isNull()) |
+                               (isnan(list_complete.max_suggested_cm)) | 
+                               (list_complete.max_suggested_cm.isNull()) |
+                               (list_complete.most_relevant.isNull()) | 
+                               (isnan(list_complete.suggested_price_kg_eur)) | 
+                               (list_complete.suggested_price_kg_eur.isNull()) |
+                               (isnan(list_complete.suggested_cm_kg_eur)) | 
+                               (list_complete.suggested_cm_kg_eur.isNull()) |
+                               (isnan(list_complete.last_12_month_volume)) |
+                               (list_complete.last_12_month_volume.isNull()) |
+                               (list_complete.base_currency.isNull()) | 
+                               (list_complete.base_unit.isNull()) | 
+                               (isnan(list_complete.suggested_price_base)) | 
+                               (list_complete.suggested_price_base.isNull()) |
+                               (isnan(list_complete.suggested_cm_base)) | 
+                               (list_complete.suggested_cm_base.isNull()) |
+                               (list_complete.ibg.isNull()) |
+                               (list_complete.alert.isNull()) | 
+                               (list_complete.condition_type.isNull()) 
+                               )
+
+
+list_data_check = list_data_check.withColumn("remarks", 
+                               when((list_complete.vpc_kg_eur.isNull()), lit("vpc_kg_eur")) \
+                               .when((list_complete.valid_price_kg_eur.isNull()), lit("valid_price_kg_eur isnull")) \
+                               .when((list_complete.valid_price_kg_eur < 0), lit("valid_price_kg_eur < 0")) \
+                               .when((list_complete.last_transaction_per_cxp.isNull()), lit("last_transaction_per_cxp")) \
+                               .when((isnan(list_complete.last_transaction_per_cxp)), lit("last_transaction_per_cxp")) \
+                               .when((isnan(list_complete.max_suggested_price)), lit("max_suggested_price")) \
+                               .when((list_complete.max_suggested_price.isNull()), lit("max_suggested_price")) \
+                               .when((isnan(list_complete.max_suggested_cm)), lit("max_suggested_cm")) \
+                               .when((list_complete.max_suggested_cm.isNull()), lit("max_suggested_cm")) \
+                               .when((list_complete.most_relevant.isNull()), lit("most_relevant")) \
+                               .when((isnan(list_complete.suggested_price_kg_eur)), lit("suggested_price_kg_eur")) \
+                               .when((list_complete.suggested_price_kg_eur.isNull()), lit("suggested_price_kg_eur")) \
+                               .when((isnan(list_complete.suggested_cm_kg_eur)), lit("suggested_cm_kg_eur")) \
+                               .when((list_complete.suggested_cm_kg_eur.isNull()), lit("suggested_cm_kg_eur")) \
+                               .when((isnan(list_complete.last_12_month_volume)), lit("last_12_month_volume")) \
+                               .when((list_complete.last_12_month_volume.isNull()), lit("last_12_month_volume")) \
+                               .when((list_complete.base_currency.isNull()), lit("base_currency")) \
+                               .when((list_complete.base_unit.isNull()), lit("base_unit")) \
+                               .when((isnan(list_complete.suggested_price_base)), lit("suggested_price_base")) \
+                               .when((list_complete.suggested_price_base.isNull()), lit("suggested_price_base")) \
+                               .when((isnan(list_complete.suggested_cm_base)), lit("suggested_cm_base")) \
+                               .when((list_complete.suggested_cm_base.isNull()), lit("suggested_cm_base")) \
+                               .when((list_complete.alert.isNull()), lit("alert")) \
+                               .when((list_complete.condition_type.isNull()), lit("condition_type")) \
+                               .when((list_complete.sales_org.isNull()), lit("sales_org null")) \
+                               .when((list_complete.sales_org == '#'), lit("sales_org = #")) \
+                               .when((list_complete.ibg.isNull()), lit("ibg")) \
+                               )
+
+
+print(list_data_check.select("vpc_kg_eur").count())
+
+list_data_check_df = DynamicFrame.fromDF(list_data_check, glueContext,"list_data_check_df" )
+datasink0 = glueContext.write_dynamic_frame.from_options(frame = list_data_check_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_3_list_complete_data_check"}, format = "parquet", transformation_ctx = "datasink0")
+
+bw_data_map = bw_data.selectExpr("unique_id", "cust_number as customer_soldto_number","cust_descrp as customer_soldto_description","account_manager as account_manager_", \
+"cust_grp_adj as marketing_customer_sold_to","prod_number as packed_material_ID","prod_descrp as packed_material_description","pfam as PH3", \
+"pline as PH4","prod_grp as produced_material_PH5","cxp_region as customer_product_region","sales_org","ibg as ML2","base_currency","base_uom as base_unit", \
+"transaction_date","transactional_vol_kg as transactional_volume_kg","giv_kg_eur as gross_invoiced_value_kg_eur","nsv_kg_eur as net_price_kg_eur","vpc_kg_eur as variable_production_cost_kg_eur", \
+"frght_kg_eur","reb_kg_eur","othvse_kg_eur as othercosts_kg_eur","cmstd_kg_eur as marginal_income1_kg_eur","incoterm1","incoterm2","valid_price_kg_eur as current_price_kg_eur",\
+"valid_from_date as current_price_validity_from","valid_to_date as current_price_validity_to","current_vpc_kg_eur", \
+"current_cm_kg_eur","next_valid_price_kg_eur","next_valid_from_date","next_valid_to_date", \
+"suggested_price_negative_margin","suggested_cm_negative_margin","suggested_price_low_cutoff","suggested_cm_low_cutoff","suggested_price_rm_passthrough", \
+"suggested_cm_rm_passthrough","suggested_price_srp as suggested_price_SRP","suggested_cm_srp as suggested_cm_SRP","alert","most_relevant as most_relevant_lens","suggested_price_kg_eur", \
+"suggested_cm_kg_eur","suggested_costs","opportunity_value_eur","last_12_month_volume","ytd_volume", "weight_rate_to_apply", "fx_rate_into_eur as exchange_rate")
+
+
+print("select done")
+
+bw_data_map = bw_data_map.withColumn("current_frght_kg_eur", bw_data_map.frght_kg_eur) 
+bw_data_map = bw_data_map.withColumn("current_reb_kg_eur", bw_data_map.reb_kg_eur) 
+bw_data_map = bw_data_map.withColumn("current_othvse_kg_eur", bw_data_map.othercosts_kg_eur) 
+
+bw_data_map = bw_data_map.withColumn("nbr_price_kg_eur", lit("")) 
+bw_data_map = bw_data_map.withColumn("nbr_costs_kg_eur", bw_data_map.suggested_costs) 
+bw_data_map = bw_data_map.withColumn("nbr_cm_kg_eur", lit("")) 
+bw_data_map = bw_data_map.withColumn("nbr_comments", lit("")) 
+
+bw_data_map2 = bw_data_map
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("transactional_volume_kg", "transactional_volume_base") 
+bw_data_map2 = bw_data_map2.withColumn("transactional_volume_base", bw_data_map2.transactional_volume_base / (bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("gross_invoiced_value_kg_eur", "gross_invoiced_value_base") 
+bw_data_map2 = bw_data_map2.withColumn("gross_invoiced_value_base", bw_data_map2.gross_invoiced_value_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("net_price_kg_eur", "net_price_base") 
+bw_data_map2 = bw_data_map2.withColumn("net_price_base", bw_data_map2.net_price_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("variable_production_cost_kg_eur", "variable_production_cost_base") 
+bw_data_map2 = bw_data_map2.withColumn("variable_production_cost_base", bw_data_map2.variable_production_cost_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("frght_kg_eur", "frght_base") 
+bw_data_map2 = bw_data_map2.withColumn("frght_base", bw_data_map2.frght_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("reb_kg_eur", "reb_base") 
+bw_data_map2 = bw_data_map2.withColumn("reb_base", bw_data_map2.reb_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("othercosts_kg_eur", "othercosts_base") 
+bw_data_map2 = bw_data_map2.withColumn("othercosts_base", bw_data_map2.othercosts_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("marginal_income1_kg_eur", "marginal_income1_base") 
+bw_data_map2 = bw_data_map2.withColumn("marginal_income1_base", bw_data_map2.marginal_income1_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("current_price_kg_eur", "current_price_base") 
+bw_data_map2 = bw_data_map2.withColumn("current_price_base", bw_data_map2.current_price_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("current_vpc_kg_eur", "current_vpc_base") 
+bw_data_map2 = bw_data_map2.withColumn("current_vpc_base", bw_data_map2.current_vpc_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("current_frght_kg_eur", "current_frght_base") 
+bw_data_map2 = bw_data_map2.withColumn("current_frght_base", bw_data_map2.current_frght_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("current_reb_kg_eur", "current_reb_base") 
+bw_data_map2 = bw_data_map2.withColumn("current_reb_base", bw_data_map2.current_reb_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("current_othvse_kg_eur", "current_othvse_base") 
+bw_data_map2 = bw_data_map2.withColumn("current_othvse_base", bw_data_map2.current_othvse_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("current_cm_kg_eur", "current_cm_base") 
+bw_data_map2 = bw_data_map2.withColumn("current_cm_base", bw_data_map2.current_cm_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_price_negative_margin", "suggested_price_negative_margin_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_price_negative_margin_base", bw_data_map2.suggested_price_negative_margin_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_cm_negative_margin", "suggested_cm_negative_margin_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_cm_negative_margin_base", bw_data_map2.suggested_cm_negative_margin_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_price_low_cutoff", "suggested_price_low_cutoff_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_price_low_cutoff_base", bw_data_map2.suggested_price_low_cutoff_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_cm_low_cutoff", "suggested_cm_low_cutoff_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_cm_low_cutoff_base", bw_data_map2.suggested_cm_low_cutoff_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_price_rm_passthrough", "suggested_price_rm_passthrough_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_price_rm_passthrough_base", bw_data_map2.suggested_price_rm_passthrough_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_cm_rm_passthrough", "suggested_cm_rm_passthrough_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_cm_rm_passthrough_base", bw_data_map2.suggested_cm_rm_passthrough_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_price_SRP", "suggested_price_SRP_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_price_SRP_base", bw_data_map2.suggested_price_SRP_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_cm_SRP", "suggested_cm_SRP_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_cm_SRP_base", bw_data_map2.suggested_cm_SRP_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_price_kg_eur", "suggested_price_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_price_base", bw_data_map2.suggested_price_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_cm_kg_eur", "suggested_cm_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_cm_base", bw_data_map2.suggested_cm_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_cm_kg_eur", "suggested_cm_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_cm_base", bw_data_map2.suggested_cm_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("suggested_costs", "suggested_costs_base") 
+bw_data_map2 = bw_data_map2.withColumn("suggested_costs_base", bw_data_map2.suggested_costs_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("opportunity_value_eur", "opportunity_value_base") 
+bw_data_map2 = bw_data_map2.withColumn("opportunity_value_base", bw_data_map2.opportunity_value_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("last_12_month_volume", "last_12_month_volume_base") 
+bw_data_map2 = bw_data_map2.withColumn("last_12_month_volume_base", bw_data_map2.last_12_month_volume_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("ytd_volume", "ytd_volume_base") 
+bw_data_map2 = bw_data_map2.withColumn("ytd_volume_base", bw_data_map2.ytd_volume_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("nbr_costs_kg_eur", "nbr_costs_base") 
+bw_data_map2 = bw_data_map2.withColumn("nbr_costs_base", bw_data_map2.nbr_costs_base / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply)) 
+
+bw_data_map2 = bw_data_map2.withColumnRenamed("nbr_price_kg_eur", "nbr_price_base") 
+bw_data_map2 = bw_data_map2.withColumnRenamed("nbr_cm_kg_eur", "nbr_cm_base") 
+
+bw_data_map2 = bw_data_map2.withColumn("next_valid_price_base", bw_data_map2.next_valid_price_kg_eur / (bw_data_map2.exchange_rate * bw_data_map2.weight_rate_to_apply))
+
+
+
+bw_data_map = bw_data_map.select("unique_id", "customer_soldto_number","customer_soldto_description","account_manager_", \
+"marketing_customer_sold_to","packed_material_ID","packed_material_description","PH3", \
+"PH4","produced_material_PH5","customer_product_region","sales_org","ML2","base_currency","base_unit", \
+"transaction_date","transactional_volume_kg","gross_invoiced_value_kg_eur","net_price_kg_eur","variable_production_cost_kg_eur", \
+"frght_kg_eur","reb_kg_eur","othercosts_kg_eur","marginal_income1_kg_eur","incoterm1","incoterm2","current_price_kg_eur",\
+"current_price_validity_from","current_price_validity_to","current_vpc_kg_eur","current_frght_kg_eur", \
+"current_reb_kg_eur","current_othvse_kg_eur","current_cm_kg_eur","next_valid_price_kg_eur","next_valid_from_date","next_valid_to_date", \
+"suggested_price_negative_margin","suggested_cm_negative_margin","suggested_price_low_cutoff","suggested_cm_low_cutoff","suggested_price_rm_passthrough", \
+"suggested_cm_rm_passthrough","suggested_price_srp","suggested_cm_srp","alert","most_relevant_lens","suggested_price_kg_eur", \
+"suggested_cm_kg_eur","suggested_costs","opportunity_value_eur","last_12_month_volume","ytd_volume","nbr_price_kg_eur","nbr_costs_kg_eur","nbr_cm_kg_eur","nbr_comments")
+
+print("new columns done")
+
+bw_data_map2 = bw_data_map2.select("unique_id", "customer_soldto_number","customer_soldto_description","account_manager_", \
+"marketing_customer_sold_to","packed_material_ID","packed_material_description","PH3", \
+"PH4","produced_material_PH5","customer_product_region","sales_org","ML2","base_currency","base_unit", \
+"transaction_date","transactional_volume_base","gross_invoiced_value_base","net_price_base","variable_production_cost_base", \
+"frght_base","reb_base","othercosts_base","marginal_income1_base","incoterm1","incoterm2","current_price_base",\
+"current_price_validity_from","current_price_validity_to","current_vpc_base","current_frght_base", \
+"current_reb_base","current_othvse_base","current_cm_base","next_valid_price_base","next_valid_from_date","next_valid_to_date", \
+"suggested_price_negative_margin_base","suggested_cm_negative_margin_base","suggested_price_low_cutoff_base","suggested_cm_low_cutoff_base","suggested_price_rm_passthrough_base", \
+"suggested_cm_rm_passthrough_base","suggested_price_srp_base","suggested_cm_srp_base","alert","most_relevant_lens","suggested_price_base", \
+"suggested_cm_base","suggested_costs_base","opportunity_value_base","last_12_month_volume_base","ytd_volume_base","nbr_price_base","nbr_costs_base","nbr_cm_base","nbr_comments")
+
+
+map1 = bw_data_map.toPandas()
+map2 = bw_data_map2.toPandas()
+
+
+
+bucket = 'cap-qa-data-lake'
+filepath = 'pricing-app/processed/analytical_layer/3_2_6_mapping_portfolio_strategic_overwrite_opportunities.xlsx'
+
+with io.BytesIO() as output:
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        map1.to_excel(writer, sheet_name='kg_eur', index=False)
+        map2.to_excel(writer, sheet_name='base_currency_uom', index=False)
+    data = output.getvalue()
+s3 = boto3.resource('s3')
+s3.Bucket(bucket).put_object(Key=filepath, Body=data)
+
+job.commit()
+"""
+

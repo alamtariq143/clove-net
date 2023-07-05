@@ -1,0 +1,719 @@
+import sys
+import boto3
+import pandas as pd
+import math
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from pyspark.sql.functions import udf
+from datetime import datetime
+
+
+def monthToNum(shortMonth):
+    mon_dict = {
+            'jan': 1,
+            'feb': 2,
+            'mar': 3,
+            'apr': 4,
+            'may': 5,
+            'jun': 6,
+            'jul': 7,
+            'aug': 8,
+            'sep': 9, 
+            'oct': 10,
+            'nov': 11,
+            'dec': 12,
+            'January': 1,
+            'February': 2,
+            'March': 3,
+            'April': 4,
+            'May': 5,
+            'June': 6,
+            'July': 7,
+            'August': 8,
+            'September': 9, 
+            'October': 10,
+            'November': 11,
+            'December': 12,
+            'january': 1,
+            'february': 2,
+            'march': 3,
+            'april': 4,
+            'may': 5,
+            'june': 6,
+            'july': 7,
+            'august': 8,
+            'september': 9, 
+            'october': 10,
+            'november': 11,
+            'december': 12,
+            'nan': 0
+    }
+    
+    return mon_dict.get(shortMonth, 0)
+
+udf_func = udf(monthToNum, IntegerType()) 
+
+
+### Delete older parquet files
+
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_7_1_transactional_data_hist_vpc_check/'
+
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_7_1_transactional_data/'
+
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_7_2_transactional_data_check/'
+
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_7_3_transactional_data_check_account_manager/'
+
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+### Athena tables to Glue Dynamic Frames
+
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_2_bw_transaction_data", transformation_ctx = "datasource0")
+country_grp  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_6_mapping_region_country_group", transformation_ctx = "datasource7")
+# acc_mgr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_14_mapping_accountmanager_input", transformation_ctx = "datasource8")
+cust_grp_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_23_mapping_customers_to_customer_group_and_ml2", transformation_ctx = "datasource13")
+prod_type  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_16_mapping_ph3_prod_type_chemistry", transformation_ctx = "datasource5")
+market_seg  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_15_mapping_market_segments", transformation_ctx = "datasource9")
+thresh_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_3_mapping_thresholds_ml2", transformation_ctx = "datasource9")
+forward_looking_rmc  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_21_mapping_forward_looking_rmc", transformation_ctx = "datasource10")
+cust_size  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_1_cust_desc_cust_group_adj_cust_segment", transformation_ctx = "datasource11")
+
+### Glue Dynamic Frames to PySpark Data Frames (+ Data filtering)
+
+
+cust_size = cust_size.toDF().selectExpr("cust_grp_adj", "cust_segment")
+cust_size = cust_size.drop_duplicates(['cust_grp_adj'])
+
+
+bw_data = bw_data.toDF()
+bw_data = bw_data.drop_duplicates()
+country_grp = country_grp.toDF().selectExpr("country_group as country_grp", "country as country_soldto")
+# acc_mgr = acc_mgr.toDF().selectExpr("ml2 as ibg", "region as cxp_region", "customer as kunnr", "customer_group_adjusted as cust_grp_adj", "sales_org as vkorg", "type", "am_system as account_mgr", "am_responsible", "product_type as prod_type")
+cust_grp_ml2 = cust_grp_ml2.toDF().selectExpr("customer_sold_to as cust_number", "marketing_customer_ship_to_description as cust_grp_adj2", "ml2 as ibg_mapping", "ml2_description as ibg_descrp_mapping") #"marketing_customer_ship_to as cust_grp_adj_id", 
+cust_grp_ml2 = cust_grp_ml2.withColumn("ibg_mapping", cust_grp_ml2.ibg_mapping.cast(LongType()))
+
+prod_type = prod_type.toDF().withColumnRenamed("prod.hier.3", "pfam").selectExpr("prod_type", "chemistry as prod_chemistry", "pfam")
+market_seg = market_seg.toDF().selectExpr("marketing_level_4 as market_segment_descrp", "ms_new as market_segment")
+thresh_ml2 = thresh_ml2.toDF().selectExpr("marketing_level_2 as ibg", "sbe as bu_scope")
+forward_looking_rmc = forward_looking_rmc.toDF().withColumnRenamed("month", "month_rmc").withColumnRenamed("rmc_manual_shipto_emea", "emea").withColumnRenamed("rmc_manual_shipto_na", "nam").withColumnRenamed("rmc_manual_shipto_latam", "latam").withColumnRenamed("rmc_manual_shipto_apac", "apac")
+forward_looking_rmc = forward_looking_rmc.withColumn("month_rmc", forward_looking_rmc.month_rmc.cast(StringType()))
+
+
+
+market_seg = market_seg.drop_duplicates(['market_segment_descrp'])
+cust_grp_ml2 = cust_grp_ml2.filter(cust_grp_ml2.cust_number != '0000000000')
+prod_type = prod_type.withColumn("pfam", prod_type.pfam.substr(-3, 3))
+
+bw_data = bw_data.na.fill(0)
+bw_data = bw_data.withColumnRenamed("sold_to_party", "cust_number")
+bw_data = bw_data.withColumnRenamed("sold_to_party_description", "cust_descrp")
+bw_data = bw_data.withColumnRenamed("marketing_customer_sold_to", "cust_grp")
+bw_data = bw_data.withColumnRenamed("cust_segment_sold_to", "cust_classification")
+bw_data = bw_data.withColumnRenamed("country_ship_to", "country_soldto")
+bw_data = bw_data.withColumnRenamed("material", "prod_number")
+bw_data = bw_data.withColumnRenamed("material_description", "prod_descrp")
+bw_data = bw_data.withColumnRenamed("unpacked_good_descrp", "prod_grp")
+bw_data = bw_data.withColumnRenamed("prod_hier_3", "pfam")
+bw_data = bw_data.withColumnRenamed("prod_hier_3_descrp", "pfam_descrp")
+bw_data = bw_data.withColumnRenamed("prod_hier_4", "pline")
+bw_data = bw_data.withColumnRenamed("prod_hier_4_descrp", "pline_descrp")
+bw_data = bw_data.withColumnRenamed("prod_hier_2", "bu")
+bw_data = bw_data.withColumnRenamed("marketing_level_2", "ibg")
+bw_data = bw_data.withColumnRenamed("ml2_id_text", "ibg_descrp")
+bw_data = bw_data.withColumnRenamed("plant", "plant")
+bw_data = bw_data.withColumnRenamed("plant_description", "plant_descrp")
+bw_data = bw_data.withColumnRenamed("marketing_level_4", "sub_market_segment")
+bw_data = bw_data.withColumnRenamed("ml4_id_text", "market_segment_descrp")
+bw_data = bw_data.withColumnRenamed("region_ship_to", "cxp_region")
+bw_data = bw_data.withColumnRenamed("extern_sales_office", "acc_mgr")
+bw_data = bw_data.withColumnRenamed("fiscal_year", "fiscal_year")
+bw_data = bw_data.withColumnRenamed("posting_period", "month")
+bw_data = bw_data.withColumnRenamed("currency", "base_currency")
+bw_data = bw_data.withColumnRenamed("unpacked_good", "unpacked_product_code")
+
+
+bw_data = bw_data.withColumnRenamed("gross_sales_qty_kg", "transactional_vol_kg")
+bw_data = bw_data.withColumnRenamed("consolidated_marginal_income_eur", "cmstd_eur")
+bw_data = bw_data.withColumnRenamed("gross_sales_eur", "giv_kg_eur")
+bw_data = bw_data.withColumnRenamed("sales_deductions_eur", "reb_kg_eur")
+bw_data = bw_data.withColumnRenamed("net_sales_eur", "nsv_kg_eur")
+bw_data = bw_data.withColumnRenamed("outward_freights_eur", "frght_kg_eur")
+
+bw_data = bw_data.withColumn("vpc_kg_eur", bw_data.total_raw_material_goods_resale_eur + bw_data.total_manufact_costs_var_eur + bw_data.variances_reposting_relocation_eur + bw_data.miscellaneous_variances_eur + bw_data.additional_consolidated_prod_cost_eur)
+bw_data = bw_data.withColumn("othvse_kg_eur", bw_data.commission_expenses_eur + bw_data.license_fees_eur + bw_data.transport_insurance_eur + bw_data.other_sales_eur)
+
+bw_data = bw_data.filter(~bw_data.prod_descrp.endswith("S001"))
+bw_data = bw_data.filter(bw_data.plant != "YBK9")
+
+
+bw_data = bw_data.filter(bw_data.giv_kg_eur > 0.0)
+bw_data = bw_data.filter(~isnan(bw_data.giv_kg_eur))
+bw_data = bw_data.filter(bw_data.giv_kg_eur.isNotNull())
+bw_data = bw_data.filter(~isnan(bw_data.vpc_kg_eur))
+bw_data = bw_data.filter(bw_data.vpc_kg_eur.isNotNull())
+bw_data = bw_data.filter(bw_data.transactional_vol_kg.isNotNull())
+bw_data = bw_data.filter(bw_data.transactional_vol_kg != 'NaN')
+bw_data = bw_data.filter(~isnan(bw_data.transactional_vol_kg))
+
+
+bw_data = bw_data.withColumn('cust_number', lpad(bw_data.cust_number.cast(StringType()), 10, '0'))
+
+cust_details = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_1_1_customer_details_mendix", transformation_ctx = "datasource5")
+cust_details = cust_details.toDF()
+
+cust_details = cust_details.select("cust_number", "sales_org", "account_mgr")
+cust_details = cust_details.drop_duplicates(["cust_number", "sales_org"])
+
+bw_data = bw_data.join(cust_details, ["cust_number","sales_org"], 'left')
+
+bw_data = bw_data.withColumn("account_manager", when(bw_data.account_mgr.isNull(), bw_data.acc_mgr).otherwise(bw_data.account_mgr))
+
+bw_data = bw_data.drop("acc_mgr", "account_mgr")
+
+bw_data = bw_data.select("cust_number","cust_descrp","cust_grp","cust_classification","country_soldto","prod_number",\
+                         "prod_descrp","prod_grp","pfam","pfam_descrp","pline","pline_descrp","sales_org","sales_org_descrp", \
+                         "plant","plant_descrp","market_segment_descrp","sub_market_segment","cxp_region","bu","ibg","ibg_descrp", \
+                         "account_manager","fiscal_year","month","base_currency","unpacked_product_code", "transactional_vol_kg", \
+                         "cmstd_eur", "giv_kg_eur", "reb_kg_eur", "nsv_kg_eur", "frght_kg_eur", "vpc_kg_eur", "othvse_kg_eur")
+
+print("market segement fix")
+
+market_segment_fix = bw_data.selectExpr("cust_number","cxp_region","bu","prod_number","sales_org", \
+                                        "month","fiscal_year","account_manager","ibg","market_segment_descrp as market_segment_descrp_new", \
+                                        "sub_market_segment as sub_market_segment_new","transactional_vol_kg").alias("market_segment_fix")
+
+market_segment_fix = market_segment_fix.sort(market_segment_fix.cust_number, market_segment_fix.cxp_region,market_segment_fix.bu, \
+                                            market_segment_fix.prod_number,market_segment_fix.sales_org,market_segment_fix.account_manager, \
+                                            market_segment_fix.ibg, market_segment_fix.fiscal_year, market_segment_fix.month, \
+                                            market_segment_fix.transactional_vol_kg.desc()).coalesce(1)
+
+bw_data = bw_data.drop("market_segment_descrp","sub_market_segment")
+
+market_segment_fix = market_segment_fix.drop_duplicates(["cust_number","cxp_region","bu","prod_number","sales_org","account_manager","ibg","month","fiscal_year"])
+
+market_segment_fix = market_segment_fix.drop("transactional_vol_kg")
+
+print("join segment fix back to main table")
+
+
+market_segment_fix = market_segment_fix.select("cust_number","cxp_region","bu","prod_number","sales_org","account_manager","ibg","month","fiscal_year", "market_segment_descrp_new","sub_market_segment_new")
+
+
+print("\n \n \n \n")
+
+bw_data = bw_data.join(market_segment_fix, ["cust_number","cxp_region","bu","prod_number","sales_org","account_manager","ibg","month","fiscal_year"], 'left')
+
+bw_data = bw_data.withColumnRenamed("sub_market_segment_new","sub_market_segment")
+
+bw_data = bw_data.withColumnRenamed("market_segment_descrp_new","market_segment_descrp")
+
+print("plant fix")
+
+plant_fix = bw_data.selectExpr("cust_number","cxp_region","bu","prod_number","sales_org", \
+                                        "month","fiscal_year","account_manager","ibg","plant as plant_new", \
+                                        "plant_descrp as plant_descrp_new","transactional_vol_kg").alias("plant_fix")
+
+plant_fix = plant_fix.sort(plant_fix.cust_number, plant_fix.cxp_region, plant_fix.bu, \
+                                            plant_fix.prod_number,plant_fix.sales_org,plant_fix.account_manager, \
+                                            plant_fix.ibg, plant_fix.fiscal_year, plant_fix.month, \
+                                            plant_fix.transactional_vol_kg.desc()).coalesce(1)
+
+bw_data = bw_data.drop("plant","plant_descrp") 
+
+
+plant_fix = plant_fix.drop_duplicates(["cust_number","cxp_region","bu","prod_number","sales_org","account_manager","ibg","month","fiscal_year"])
+
+plant_fix = plant_fix.drop("transactional_vol_kg")
+
+print("join plant fix back to main table")
+
+
+plant_fix = plant_fix.select("cust_number","cxp_region","bu","prod_number","sales_org","account_manager","ibg","month","fiscal_year", "plant_new","plant_descrp_new")
+
+
+print("\n \n \n \n")
+
+bw_data.show(5)
+
+print(bw_data.count())
+bw_data = bw_data.join(plant_fix, ["cust_number","cxp_region","bu","prod_number","sales_org","account_manager","ibg","month","fiscal_year"], 'left')
+print(bw_data.count())
+bw_data = bw_data.withColumnRenamed("plant_new","plant")
+
+bw_data = bw_data.withColumnRenamed("plant_descrp_new","plant_descrp")
+
+
+bw_data = bw_data.select("cust_number","cust_descrp","cust_grp","cust_classification","country_soldto","prod_number",\
+                         "prod_descrp","prod_grp","pfam","pfam_descrp","pline","pline_descrp","sales_org","sales_org_descrp", \
+                         "plant","plant_descrp","market_segment_descrp","sub_market_segment","cxp_region","bu","ibg","ibg_descrp", \
+                         "account_manager","fiscal_year","month","base_currency","unpacked_product_code", "transactional_vol_kg", \
+                         "cmstd_eur", "giv_kg_eur", "reb_kg_eur", "nsv_kg_eur", "frght_kg_eur", "vpc_kg_eur", "othvse_kg_eur")
+
+bw_data_fix = bw_data.select("cust_number","prod_number","market_segment_descrp","sub_market_segment", \
+"cxp_region","ibg","ibg_descrp","account_manager","fiscal_year","month")
+
+bw_data_fix = bw_data_fix.withColumn("fiscal_year", bw_data_fix.fiscal_year.cast(LongType())).withColumn("month", bw_data_fix.month.cast(IntegerType()))
+
+bw_data_fix = bw_data_fix.sort(bw_data_fix.cust_number, bw_data_fix.prod_number, bw_data_fix.cxp_region, bw_data_fix.fiscal_year.desc(), bw_data_fix.month.desc())
+
+bw_data_fix = bw_data_fix.drop_duplicates(["cust_number","prod_number","cxp_region"]).drop("fiscal_year","month")
+
+bw_data = bw_data.drop("market_segment_descrp","sub_market_segment","ibg","ibg_descrp","account_manager")
+
+bw_data = bw_data.join(bw_data_fix, ["cust_number","prod_number","cxp_region"], 'left')
+
+
+bw_data = bw_data.groupBy("cust_number", "cust_descrp", "cust_grp", "cust_classification", "country_soldto", "prod_number", \
+                          "prod_descrp", "prod_grp", "pfam", "pfam_descrp", "pline", "pline_descrp",  "sales_org", "sales_org_descrp", \
+                          "plant", "plant_descrp", "market_segment_descrp", "sub_market_segment", "cxp_region", "bu","ibg", "ibg_descrp", "account_manager", \
+                          "fiscal_year", "month", "base_currency", "unpacked_product_code").agg(avg("transactional_vol_kg").alias("transactional_vol_kg"), \
+                                                                                                avg("cmstd_eur").alias("cmstd_eur"), \
+                                                                                                avg("giv_kg_eur").alias("giv_kg_eur"), \
+                                                                                                avg("reb_kg_eur").alias("reb_kg_eur"), \
+                                                                                                avg("nsv_kg_eur").alias("nsv_kg_eur"), \
+                                                                                                avg("frght_kg_eur").alias("frght_kg_eur"), \
+                                                                                                avg("vpc_kg_eur").alias("vpc_kg_eur"), \
+                                                                                                avg("othvse_kg_eur").alias("othvse_kg_eur"))
+                                                                                                                                    
+#bw_data = bw_data.join(broadcast(bw_data_agg), ["cust_number", "cxp_region","bu","ibg", "prod_number","account_manager", "sales_org", "month", "fiscal_year"] ,'left')
+
+#bw_data = bw_data.drop_duplicates()
+
+bw_data = bw_data.withColumn("marginal_income1", bw_data.giv_kg_eur - (bw_data.reb_kg_eur + bw_data.vpc_kg_eur + bw_data.frght_kg_eur + bw_data.othvse_kg_eur + bw_data.cmstd_eur))
+
+
+bw_data = bw_data.withColumn('giv_kg_eur', col('giv_kg_eur')/col('transactional_vol_kg'))
+bw_data = bw_data.withColumn('reb_kg_eur', col('reb_kg_eur')/col('transactional_vol_kg'))
+bw_data = bw_data.withColumn('vpc_kg_eur', col('vpc_kg_eur')/col('transactional_vol_kg'))
+bw_data = bw_data.withColumn('nsv_kg_eur', col('nsv_kg_eur')/col('transactional_vol_kg'))
+bw_data = bw_data.withColumn('frght_kg_eur', col('frght_kg_eur')/col('transactional_vol_kg'))
+bw_data = bw_data.withColumn('othvse_kg_eur', col('othvse_kg_eur')/col('transactional_vol_kg'))
+bw_data = bw_data.withColumn('cmstd_kg_eur', col('cmstd_eur')/col('transactional_vol_kg'))
+
+#bw_data = bw_data.withColumn("marginal_income2", bw_data.giv_kg_eur - (bw_data.reb_kg_eur + bw_data.vpc_kg_eur + bw_data.frght_kg_eur + bw_data.othvse_kg_eur + bw_data.cmstd_kg_eur))
+
+bw_data = bw_data.withColumn("marginal_income1", bw_data.marginal_income1 / bw_data.transactional_vol_kg)
+
+bw_data = bw_data.filter(bw_data.transactional_vol_kg > 0.0)
+bw_data = bw_data.filter(bw_data.cust_number != '#')
+bw_data = bw_data.withColumn("ibg", bw_data.ibg.cast(LongType()))
+
+
+#Joins
+
+print("cust_grp_ml2")
+print(cust_grp_ml2.select("cust_number").distinct().count())
+print(cust_grp_ml2.select("cust_number").count())
+bw_data.show(2)
+bw_data = bw_data.join(broadcast(cust_grp_ml2), "cust_number" ,'left')
+print(bw_data.select("cust_number").count())
+
+#############
+
+bw_data_test_df = DynamicFrame.fromDF(bw_data, glueContext,"bw_data_" )
+bw_data = bw_data.withColumn('ibg', when(((isnan(bw_data.ibg)) | bw_data.ibg.isNull()), bw_data.ibg_mapping).otherwise(bw_data.ibg)) 
+bw_data = bw_data.withColumn('ibg_descrp', when(((isnan(bw_data.ibg)) | bw_data.ibg.isNull()), bw_data.ibg_descrp_mapping).otherwise(bw_data.ibg_descrp)) 
+bw_data = bw_data.withColumn('cust_grp_adj', when(((isnan(bw_data.cust_grp)) | bw_data.cust_grp.isNull()), bw_data.cust_grp_adj2).otherwise(bw_data.cust_grp)) 
+
+bw_data = bw_data.drop("ibg_mapping", "ibg_descrp_mapping", "cust_grp_adj2")
+
+print("cust_size")
+
+
+bw_data = bw_data.join(cust_size, "cust_grp_adj", 'left')
+
+#############
+bw_data_test_df = DynamicFrame.fromDF(bw_data, glueContext,"bw_data_" )
+
+
+print("country_grp")
+
+
+bw_data = bw_data.join(country_grp, "country_soldto" ,'left')
+print(bw_data.select("cust_number").count())
+#############
+
+
+print("prod_type")
+
+bw_data = bw_data.join(prod_type, "pfam" ,'left')
+print(bw_data.select("cust_number").count())
+#############
+
+
+
+
+
+print("market_seg")
+
+bw_data = bw_data.join(market_seg, "market_segment_descrp" ,'left')
+print(bw_data.select("cust_number").count())
+#############
+bw_data_test_df = DynamicFrame.fromDF(bw_data, glueContext,"bw_data_" )
+
+
+print("thresh_ml2")
+
+print("\n \n")
+
+bw_data.show(2)
+bw_data = bw_data.join(thresh_ml2, "ibg" ,'left')
+
+print("\n \n")
+
+#############
+
+
+bw_data = bw_data.filter(bw_data.bu_scope != "Out of scope")
+
+
+
+bw_data = bw_data.withColumn('transaction_date', concat(col('month'), lit("-01-"), col('fiscal_year')))
+
+bw_data = bw_data.withColumn('date', concat(col('fiscal_year'), lit("-"), col('month'), lit("-01")))
+bw_data = bw_data.withColumn('date', col('date').cast(DateType()))
+
+bw_data = bw_data.withColumn('date_48', concat(lit(year(current_date()) - 4), lit("-"), lit(month(current_date()) - 1), lit("-01")))
+bw_data = bw_data.withColumn('date_48', col('date_48').cast(DateType()))
+
+bw_data = bw_data.withColumn('date_12', concat(lit(year(current_date()) - 1), lit("-"), lit(month(current_date()) - 1), lit("-01")))
+bw_data = bw_data.withColumn('date_12', col('date_12').cast(DateType()))
+
+
+bw_data = bw_data.withColumn("12_month_rolling", when(bw_data.date >= bw_data.date_12, "Yes").otherwise("No"))
+bw_data = bw_data.withColumn("48_month_rolling", when(bw_data.date >= bw_data.date_48, "Yes").otherwise("No"))
+
+print("\n 1 \n")
+forward_looking_rmc = forward_looking_rmc.withColumn("month_rmc", udf_func(col("month_rmc")))
+forward_looking_rmc.show(3)
+forward_looking_rmc = forward_looking_rmc.sort(forward_looking_rmc.year.desc(), forward_looking_rmc.month_rmc.desc()).coalesce(1)
+forward_looking_rmc = forward_looking_rmc.drop_duplicates(['unpacked_product_code'])
+forward_looking_rmc = forward_looking_rmc.select("unpacked_product_code", "nam", "latam", "apac", "emea")
+
+print("\n 2 \n")
+
+bw_data_12 = bw_data.alias("bw_data_12")
+
+bw_data_12 = bw_data_12.join(forward_looking_rmc, "unpacked_product_code" ,'left')
+
+print("\n 3 \n")
+
+bw_data_12 = bw_data_12.withColumn("current_vpc_kg_eur_new", when(bw_data_12.cxp_region == "NA", bw_data_12.nam)
+                                 .when(bw_data_12.cxp_region == "LATAM", bw_data_12.latam)
+                                 .when(bw_data_12.cxp_region == "EMEA", bw_data_12.emea)
+                                 .when(bw_data_12.cxp_region == "APAC", bw_data_12.apac)
+                                 .otherwise(0.0))
+                                 
+print("\n 4 \n")
+
+print("\n \n whaaaat")
+
+bw_data_hist = bw_data_12.select("unpacked_product_code", "cxp_region", "fiscal_year", "month", "vpc_kg_eur")
+
+print("\n\n here???")
+
+bw_data_hist = bw_data_hist.groupBy("unpacked_product_code", "cxp_region", "fiscal_year", "month").agg(mean("vpc_kg_eur").alias("current_vpc_kg_eur_old"))
+
+print("\n 5 \n")
+
+bw_data_hist = bw_data_hist.sort(bw_data_hist.fiscal_year.desc(), bw_data_hist.month.desc())
+
+print("\n 6 \n")
+
+bw_data_hist = bw_data_hist.drop_duplicates(['unpacked_product_code', 'cxp_region'])
+bw_data_hist = bw_data_hist.select("unpacked_product_code", "cxp_region", "current_vpc_kg_eur_old")
+
+bw_data_hist = bw_data_hist.withColumnRenamed("unpacked_product_code", "unpacked_product_code")
+
+print("\n 7 \n")
+
+print("here??")
+
+bw_data_12.show(4)
+
+bw_data_12 = bw_data_12.join(broadcast(bw_data_hist), ["unpacked_product_code", "cxp_region"] ,'left')
+
+print("???")
+
+bw_data_hist_df = DynamicFrame.fromDF(bw_data_12, glueContext,"bw_data_hist_df" )
+
+
+print("???")
+
+datasink12 = glueContext.write_dynamic_frame.from_options(frame = bw_data_hist_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_7_1_transactional_data_hist_vpc_check"}, format = "parquet", transformation_ctx = "datasink12")
+
+bw_data_12 = bw_data_12.withColumn('current_vpc_kg_eur', when(( ((isnan(bw_data_12.current_vpc_kg_eur_new)) | bw_data_12.current_vpc_kg_eur_new.isNull()) | ((bw_data_12.current_vpc_kg_eur_new == 0) & ((bw_data_12.current_vpc_kg_eur_old != 0) & (~isnan(bw_data_12.current_vpc_kg_eur_old)))) ), bw_data_12.current_vpc_kg_eur_old).otherwise(bw_data_12.current_vpc_kg_eur_new))
+
+bw_data_12 = bw_data_12.select("unpacked_product_code", "cxp_region", "current_vpc_kg_eur")
+
+bw_data_12 = bw_data_12.drop_duplicates(['unpacked_product_code', 'cxp_region'])
+
+
+print("\n \n")
+
+print(bw_data.select("cust_number").count())
+
+
+bw_data_12 = bw_data_12.withColumnRenamed("unpacked_product_code", "unpacked_product_code")
+
+
+bw_data = bw_data.join(bw_data_12, ["unpacked_product_code", "cxp_region"] ,'left')
+
+
+print("\n 8 \n")
+
+
+
+bw_data = bw_data.withColumn('upload_date', current_timestamp())
+bw_data = bw_data.withColumn('source_system', lit("transaction_data_bw"))
+
+
+bw_data = bw_data.select("cust_number","cust_descrp","cust_grp","cust_grp_adj","cust_segment","cust_classification","country_soldto",\
+"country_grp","prod_number","prod_descrp","prod_grp", "unpacked_product_code", "pfam", "pfam_descrp", "pline", "pline_descrp", "prod_chemistry", \
+"prod_type","sales_org","sales_org_descrp","plant","plant_descrp","market_segment","market_segment_descrp","sub_market_segment", \
+"cxp_region","bu","ibg","ibg_descrp","account_manager","transaction_date","fiscal_year","month","base_currency", \
+"transactional_vol_kg","giv_kg_eur","reb_kg_eur","vpc_kg_eur","nsv_kg_eur","frght_kg_eur","othvse_kg_eur","cmstd_kg_eur", \
+"cmstd_eur","current_vpc_kg_eur","marginal_income1", "48_month_rolling","12_month_rolling","bu_scope","upload_date","source_system")
+
+
+print(bw_data.select("cust_number").count())
+print('*' * 30)
+
+print("\n 9 \n")
+
+bw_data = bw_data.filter(bw_data.transactional_vol_kg > 0.0)
+bw_data = bw_data.filter(bw_data.current_vpc_kg_eur > 0.0)
+
+
+print("\n --------------------------------------------------------------------------------------- n")
+print(bw_data.select("cust_number").count())
+
+
+
+acc_mgr_check = bw_data.groupBy("cust_number", "prod_number", "sales_org", "cxp_region", "ibg").agg(countDistinct("account_manager").alias("no_of_acc_mgr"), \
+                                                                                                collect_set("account_manager").alias("account_manager")
+                                                                                                )
+
+
+acc_mgr_check = acc_mgr_check.filter(acc_mgr_check.no_of_acc_mgr > 1)
+
+acc_mgr_check = acc_mgr_check.select("cust_number", "prod_number", "sales_org", "cxp_region", "ibg", "account_manager")
+
+
+bw_data_check = bw_data.filter(((bw_data.marginal_income1 > 0.001) | (bw_data.marginal_income1 < -0.001))| 
+                               (bw_data.account_manager == "#") | 
+                               (bw_data.sales_org == "#") | 
+                               (bw_data.cust_number.isNull()) | 
+                               (bw_data.cust_descrp.isNull()) | 
+                               (bw_data.cust_grp.isNull()) | 
+                               (bw_data.cust_grp_adj.isNull()) | 
+                               (bw_data.cust_classification.isNull()) | 
+                               (bw_data.country_soldto.isNull()) | 
+                               (bw_data.country_grp.isNull()) | 
+                               (bw_data.prod_number.isNull()) | 
+                               (bw_data.prod_descrp.isNull()) | 
+                               (bw_data.prod_grp.isNull()) | 
+                               (bw_data.unpacked_product_code.isNull()) |
+                               (bw_data.pfam.isNull()) | 
+                               (bw_data.pfam_descrp.isNull()) | 
+                               (bw_data.pline.isNull()) | 
+                               (bw_data.pline_descrp.isNull()) | 
+                               (bw_data.prod_chemistry.isNull()) | 
+                               (bw_data.prod_type.isNull()) | 
+                               (bw_data.sales_org.isNull()) | 
+                               (bw_data.sales_org_descrp.isNull()) | 
+                               (bw_data.plant.isNull()) | 
+                               (bw_data.plant_descrp.isNull()) | 
+                               (bw_data.market_segment.isNull()) | 
+                               (bw_data.market_segment_descrp.isNull()) | 
+                               (bw_data.sub_market_segment.isNull()) | 
+                               (bw_data.cxp_region.isNull()) | 
+                               (bw_data.bu.isNull()) | 
+                               (bw_data.ibg.isNull()) | 
+                               (bw_data.ibg_descrp.isNull()) | 
+                               (bw_data.account_manager.isNull()) | 
+                               (bw_data.fiscal_year.isNull()) | 
+                               (bw_data.month.isNull()) | 
+                               (bw_data.transactional_vol_kg.isNull()) | 
+                               (bw_data.current_vpc_kg_eur.isNull()) | 
+                               (isnan(bw_data.transactional_vol_kg)) | 
+                               (bw_data.vpc_kg_eur < 0) | 
+                               (bw_data.reb_kg_eur < 0) | 
+                               (bw_data.frght_kg_eur < 0) | 
+                               (isnan(bw_data.current_vpc_kg_eur)) |
+                               (bw_data.giv_kg_eur < 0)
+                               )
+
+bw_data_check = bw_data_check.withColumn("remarks", 
+                               when(((bw_data.marginal_income1 > 0.001) | (bw_data.marginal_income1 < -0.001)), lit("marginal income not zero") ) \
+                               .when((bw_data.account_manager == "#"), lit("acc_mgr = #")) \
+                               .when((bw_data.sales_org == "#"), lit("sales_org = #")) \
+                               .when((bw_data.cust_number.isNull()), lit("cust_number missing")) \
+                               .when((bw_data.cust_descrp.isNull()), lit("cust_descrp missing")) \
+                               .when((bw_data.cust_grp.isNull()), lit("cust_grp missing")) \
+                               .when((bw_data.cust_grp_adj.isNull()), lit("cust_grp_adj missing")) \
+                               .when((bw_data.cust_classification.isNull()), lit("cust_classification missing")) \
+                               .when((bw_data.country_soldto.isNull()), lit("cust_number missing")) \
+                               .when((bw_data.country_grp.isNull()), lit("country_grp missing")) \
+                               .when((bw_data.prod_number.isNull()), lit("prod_number missing")) \
+                               .when((bw_data.prod_descrp.isNull()), lit("prod_descrp missing")) \
+                               .when((bw_data.prod_grp.isNull()), lit("prod_grp missing")) \
+                               .when((bw_data.unpacked_product_code.isNull()), lit("unpacked_product_code missing")) \
+                               .when((bw_data.pfam.isNull()), lit("pfam missing")) \
+                               .when((bw_data.pfam_descrp.isNull()), lit("pfam_descrp missing")) \
+                               .when((bw_data.pline.isNull()), lit("pline missing")) \
+                               .when((bw_data.pline_descrp.isNull()), lit("pline_descrp missing")) \
+                               .when((bw_data.prod_chemistry.isNull()), lit("prod_chemistry missing")) \
+                               .when((bw_data.prod_type.isNull()), lit("prod_type missing")) \
+                               .when((bw_data.sales_org.isNull()), lit("sales_org missing")) \
+                               .when((bw_data.sales_org_descrp.isNull()), lit("sales_org_descrp missing")) \
+                               .when((bw_data.plant.isNull()), lit("plant missing")) \
+                               .when((bw_data.plant_descrp.isNull()), lit("plant_descrp missing")) \
+                               .when((bw_data.market_segment.isNull()), lit("market_segment missing")) \
+                               .when((bw_data.market_segment_descrp.isNull()), lit("market_segment_descrp missing")) \
+                               .when((bw_data.sub_market_segment.isNull()), lit("sub_market_segment missing")) \
+                               .when((bw_data.cxp_region.isNull()), lit("cxp_region missing")) \
+                               .when((bw_data.bu.isNull()), lit("bu missing")) \
+                               .when((bw_data.ibg.isNull()), lit("ibg missing")) \
+                               .when((bw_data.ibg_descrp.isNull()), lit("ibg_descrp missing")) \
+                               .when((bw_data.account_manager.isNull()), lit("account_manager missing")) \
+                               .when((bw_data.fiscal_year.isNull()), lit("fiscal_year missing")) \
+                               .when((bw_data.month.isNull()), lit("month missing")) \
+                               .when((bw_data.transactional_vol_kg.isNull()), lit("transactional_vol_kg missing")) \
+                               .when((bw_data.current_vpc_kg_eur.isNull()), lit("current_vpc_kg_eur missing")) \
+                               .when((isnan(bw_data.transactional_vol_kg)), lit("transactional_vol_kg missing")) \
+                               .when((bw_data.vpc_kg_eur < 0), lit("vpc_kg_eur negative")) \
+                               .when((isnan(bw_data.current_vpc_kg_eur)), lit("current_vpc_kg_eur missing")) \
+                               .when((bw_data.reb_kg_eur < 0), lit("reb_kg_eur negative")) \
+                               .when((bw_data.frght_kg_eur < 0), lit("frght_kg_eur negative")) \
+                               .when((bw_data.giv_kg_eur < 0), lit("giv_kg_eur negative")) \
+                               )
+
+
+print(bw_data_check.select("cust_number").count())
+
+print("\n \n")
+
+'''
+bw_data = bw_data.filter(((bw_data.marginal_income1 < 0.001) & (bw_data.marginal_income1 > -0.001)) &
+                         (bw_data.account_manager != '#') & 
+                         (bw_data.sales_org != "#") & 
+                         (bw_data.cust_number.isNotNull()) & 
+                         (bw_data.cust_descrp.isNotNull()) & 
+                         (bw_data.cust_grp.isNotNull()) & 
+                         (bw_data.cust_grp_adj.isNotNull()) & 
+                         (bw_data.cust_classification.isNotNull()) & 
+                         (bw_data.country_soldto.isNotNull()) & 
+                         (bw_data.country_grp.isNotNull()) & 
+                         (bw_data.prod_number.isNotNull()) & 
+                         (bw_data.prod_descrp.isNotNull()) & 
+                         (bw_data.prod_grp.isNotNull()) & 
+                         (bw_data.pfam.isNotNull()) & 
+                         (bw_data.pfam_descrp.isNotNull()) & 
+                         (bw_data.pline.isNotNull()) & 
+                         (bw_data.pline_descrp.isNotNull()) & 
+                         (bw_data.prod_chemistry.isNotNull()) & 
+                         (bw_data.prod_type.isNotNull()) & 
+                         (bw_data.sales_org.isNotNull()) & 
+                         (bw_data.sales_org_descrp.isNotNull()) & 
+                         (bw_data.plant.isNotNull()) & 
+                         (bw_data.plant_descrp.isNotNull()) & 
+                         (bw_data.market_segment.isNotNull()) & 
+                         (bw_data.market_segment_descrp.isNotNull()) & 
+                         (bw_data.sub_market_segment.isNotNull()) & 
+                         (bw_data.cxp_region.isNotNull()) & 
+                         (bw_data.bu.isNotNull()) & 
+                         (bw_data.ibg.isNotNull()) & 
+                         (bw_data.ibg_descrp.isNotNull()) & 
+                         (bw_data.account_manager.isNotNull()) & 
+                         (bw_data.fiscal_year.isNotNull()) & 
+                         (bw_data.month.isNotNull()) & 
+                         (bw_data.transactional_vol_kg.isNotNull()) & 
+                         (bw_data.current_vpc_kg_eur.isNotNull()) & 
+                         (~isnan(bw_data.current_vpc_kg_eur)) & 
+                         (~isnan(bw_data.transactional_vol_kg)))
+                        
+'''                  
+
+print("\n \n")
+print(bw_data.select("cust_number").count())
+print("hm1")
+
+#PySpark Data Frame to Glue Dynamic Frame
+bw_data = bw_data.repartition(1)
+bw_data_df = DynamicFrame.fromDF(bw_data, glueContext,"bw_data_df" )
+bw_data_check_df = DynamicFrame.fromDF(bw_data_check, glueContext,"bw_data_check_df" )
+
+acc_mgr_data_check_df = DynamicFrame.fromDF(acc_mgr_check, glueContext,"bw_data_check_df" )
+
+
+### Export as Parquet files to S3 bucket
+print("hm2")
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = bw_data_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_7_1_transactional_data"}, format = "parquet", transformation_ctx = "datasink4")
+
+datasink0 = glueContext.write_dynamic_frame.from_options(frame = bw_data_check_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_7_2_transactional_data_check"}, format = "parquet", transformation_ctx = "datasink0")
+
+datasink8 = glueContext.write_dynamic_frame.from_options(frame = acc_mgr_data_check_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_7_3_transactional_data_check_account_manager"}, format = "parquet", transformation_ctx = "datasink8")
+
+
+print("hm3")
+
+job.commit()
+
+

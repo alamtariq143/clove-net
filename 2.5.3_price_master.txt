@@ -1,0 +1,485 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from pyspark.sql.window import Window
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+
+'''
+## TODO
+
+## - Delete old parquet files for all by-products of price master
+
+
+'''
+
+
+s3_client = boto3.client('s3')
+
+BUCKET = 'cap-qa-data-lake'
+
+PREFIX = 'pricing-app/processed/normalization_layer/test/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_3_7_cxp_master/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_3_3_cxp_scale_rate_qty_mendix/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+
+
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+knvv  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_knvv", transformation_ctx = "datasource0")
+konm  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_konm", transformation_ctx = "datasource1")
+konp  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_konp", transformation_ctx = "datasource2")
+a970  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_a970", transformation_ctx = "datasource3")
+a701  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_a701", transformation_ctx = "datasource4")
+marm  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_marm", transformation_ctx = "datasource32")
+cust_details = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_1_1_customer_details_mendix", transformation_ctx = "datasource5")
+fx_rate  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_4_3_mapping_fx_rate", transformation_ctx = "datasource15")
+prod_details = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_2_1_product_details_mendix", transformation_ctx = "datasource7")
+t006 = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_t006", transformation_ctx = "datasource8")
+
+
+prod_details.printSchema()
+knvv = knvv.toDF().selectExpr("konda", "kdgrp","kunnr as kunag","kztlf", "zterm", "waers", "kalks", "vkorg as vkorg_knvv", "vtweg", "vkgrp", "inco1 as inco1_knvv", "inco2", "bzirk")
+konm = konm.toDF().selectExpr("knumh", "kstbm as kstbm_m", "kbetr as kbetr_m")
+konp = konp.toDF().selectExpr("knumh", "kstbm as kstbm_p", "kbetr as kbetr_p", "kmein as uom_p", "konms as uom_scale_p", "kpein as per_p", "konwa as konwa_p", "loevm_ko")
+a970 = a970.toDF().select("kappl","kschl","vkorg","konda", "waerk","inco1","matnr","datbi","datab","knumh")
+a701 = a701.toDF().select("kappl","kschl","vkorg","kunag", "waerk","inco1","matnr","datbi","datab","knumh")
+marm = marm.toDF().select("matnr","meinh","umrez","umren")
+a701.printSchema()
+a970.printSchema()
+a701 = a701.filter((a701.kschl == 'YP00') | (a701.kschl == 'YP11'))
+
+marm = marm.filter(marm.meinh == 'ST')
+
+t006 = t006.toDF().selectExpr("msehi as uom", "zaehl", "nennr", "exp10", "dimid")
+t006 = t006.filter(t006.dimid == 'MASS')
+t006 = t006.withColumn("weight_rate_to_apply", (t006.zaehl/t006.nennr) * pow(10, t006.exp10))
+
+t006 = t006.select("uom", "weight_rate_to_apply")
+
+konm = konm.withColumn('uom_m', lit("KG")) 
+konm = konm.withColumn('uom_scale_m', lit("KG")) 
+konm = konm.withColumn('per_m', lit(1.0)) 
+konm = konm.withColumn('konwa_m', lit("EUR"))
+
+deletion_flag = konp.select("knumh", "loevm_ko")
+deletion_flag = deletion_flag.drop_duplicates(['knumh'])
+
+deletion_flag.filter(deletion_flag.knumh == '0012746580').show()
+
+
+konp = konp.withColumn("uom_scale_p", when((konp.uom_scale_p.isNull()) | (konp.uom_scale_p == ''), konp.uom_p).otherwise(konp.uom_scale_p))
+
+prod_details = prod_details.toDF()
+prod_details = prod_details.select('prod_number').distinct()
+
+print("hm")
+cust_details = cust_details.toDF().selectExpr("cust_number as kunag", "ibg", "cust_region", "sales_org as vkorg")
+cust_details = cust_details.withColumn("cust_sales", concat(cust_details.kunag, cust_details.vkorg))
+
+cust_list = cust_details.select('cust_sales').distinct()
+
+cust_details = cust_details.selectExpr("kunag", "ibg", "cust_region")
+cust_details = cust_details.drop_duplicates(["kunag", "ibg", "cust_region"])
+
+
+
+print("hmm")
+fx_rate = fx_rate.toDF().selectExpr('from_currency as konwa', 'to_currency', 'exchange_rate as fx_rate_into_eur')
+fx_rate = fx_rate.filter((fx_rate.konwa != 'EUR') & (fx_rate.to_currency == 'EUR'))
+
+
+a970 = a970.join(broadcast(knvv.na.drop(subset=["vkorg_knvv","vtweg","konda"])), "konda", 'inner').selectExpr("kappl", "kschl", "vkorg", "kunag", "waerk", "inco1", "matnr", "datbi", "datab", "knumh")
+
+a970 = a970.withColumn('type1', lit("a970")) 
+a701 = a701.withColumn('type1', lit("a701")) 
+
+
+konm = konm.withColumn('type2_m', lit("konm").cast(StringType())) 
+konp = konp.withColumn('type2_p', lit("konp").cast(StringType())) 
+
+konp = konp.withColumn("kbetr_p", konp.kbetr_p.cast(DoubleType()))
+konm = konm.withColumn("kbetr_m", konm.kbetr_m.cast(DoubleType()))
+
+
+konp = konp.filter(konp.kbetr_p != 0.0)
+konp = konp.filter(konp.loevm_ko != 'X')
+
+
+print(a701.count())
+
+a701 = a701.join(deletion_flag, "knumh", 'left')
+
+
+a701 = a701.filter(a701.loevm_ko != 'X')
+
+
+a701 = a701.drop("loevm_ko")
+
+del deletion_flag
+print(a970.columns)
+
+a970 = a970.select("kunag", "inco1", "matnr", "vkorg", "knumh", "datbi", "datab", "kschl", "type1")
+a701 = a701.select("kunag", "inco1", "matnr", "vkorg", "knumh", "datbi", "datab", "kschl", "type1")
+
+basedf = a970.union(a701).selectExpr("kunag", "inco1", "matnr", "vkorg", "knumh", "datbi as valid_to", "datab as valid_from", "kschl as cond_type", "type1")
+
+
+
+basedf = basedf.join(broadcast(knvv.selectExpr("kunag", "vkorg_knvv as vkorg", "inco1_knvv as inco1", "inco2")), ["kunag", "vkorg", "inco1"], 'left')
+
+del a970
+del a701
+
+print(basedf.dtypes)
+
+prod_details = prod_details.toPandas()
+prod_details = prod_details['prod_number'].tolist()
+
+cust_list = cust_list.toPandas()
+cust_list = cust_list['cust_sales'].tolist()
+
+basedf = basedf.withColumn("cust_sales", concat(basedf.kunag, basedf.vkorg))
+print(basedf.count())
+
+
+basedf = basedf.filter(basedf.matnr.isin(prod_details))
+
+basedf = basedf.filter(basedf.cust_sales.isin(cust_list))
+
+
+basedf = basedf.join(broadcast(konp), "knumh" ,'left')
+
+print('basedf konp')
+
+basedf = basedf.join(broadcast(konm), "knumh" ,'left')
+print("konm \n")
+
+print('future_basedf knumh')
+
+basedf = basedf.withColumn('uom', when((isnan(basedf.uom_p)) | (basedf.uom_p.isNull()), basedf.uom_m).otherwise(basedf.uom_p))
+basedf = basedf.withColumn('uom_scale', when((isnan(basedf.uom_scale_p)) | (basedf.uom_scale_p.isNull()), basedf.uom_scale_m).otherwise(basedf.uom_scale_p))
+
+#
+#basedf.filter(groupBy("uom").count().show()
+basedf = basedf.withColumn('per', when((isnan(basedf.per_p)) | (basedf.per_p.isNull()), basedf.per_m).otherwise(basedf.per_p)) 
+basedf = basedf.withColumn('konwa', when((isnan(basedf.konwa_p)) | (basedf.konwa_p.isNull()), basedf.konwa_m).otherwise(basedf.konwa_p)) 
+
+
+basedf = basedf.withColumn('kbetr', when((isnan(basedf.kbetr_m)) | (basedf.kbetr_m.isNull()), basedf.kbetr_p).otherwise(basedf.kbetr_m)) 
+basedf = basedf.withColumn('kstbm', when((isnan(basedf.kstbm_m)) | (basedf.kstbm_m.isNull()), basedf.kstbm_p).otherwise(basedf.kstbm_m)) 
+
+basedf = basedf.withColumn('type2', when(basedf.type2_m.isNull(), basedf.type2_p).otherwise(basedf.type2_m)) 
+basedf = basedf.withColumn('type2', when(basedf.type2_p.isNull(), basedf.type2_m).otherwise(basedf.type2_p)) 
+
+basedf = basedf.join(broadcast(cust_details), "kunag" ,'left')
+print("cust_details \n")
+#print(basedf.select("kunag").count())
+
+basedf = basedf.withColumn('uom', when(basedf.uom == 'K', "KG").otherwise(basedf.uom))
+basedf = basedf.withColumn('uom', when(basedf.uom == 'EUR', "KG").otherwise(basedf.uom))
+
+
+basedf = basedf.withColumn('uom_scale', when(basedf.uom_scale == 'K', "KG").otherwise(basedf.uom_scale))
+basedf = basedf.withColumn('uom_scale', when(basedf.uom_scale == 'EUR', "KG").otherwise(basedf.uom_scale))
+
+basedf = basedf.join(broadcast(t006), "uom" ,'left')
+basedf = basedf.join(t006.selectExpr("uom as uom_scale", "weight_rate_to_apply as weight_rate_to_apply_scale"), "uom_scale" ,'left')
+
+
+print("t006 \n")
+#print(basedf.select("kunag").count())
+
+print("ST to UOM")
+print(basedf.count())
+basedf.show(5)
+basedf = basedf.join(broadcast(marm), "matnr" ,'left')
+print(basedf.count())
+basedf = basedf.withColumn("weight_rate_to_apply", when(basedf.uom == "ST", basedf.umrez / basedf.umren).otherwise(basedf.weight_rate_to_apply))
+basedf = basedf.withColumn("weight_rate_to_apply_scale", when(basedf.uom == "ST", basedf.umrez / basedf.umren).otherwise(basedf.weight_rate_to_apply_scale))
+
+basedf = basedf.drop('umrez','umren')
+
+
+basedf = basedf.withColumn('scales_qty', basedf.kstbm)
+
+#basedf = basedf.withColumn('konwa', when(basedf.konwa.isNull(), "EUR").otherwise(basedf.konwa))
+#basedf = basedf.withColumn('uom', when(basedf.uom.isNull(), "KG").otherwise(basedf.uom))
+
+basedf = basedf.withColumn('per', when(isnan(basedf.per), 1.0).otherwise(basedf.per))
+
+basedf = basedf.withColumn('valid_price_base_currency', round(basedf.kbetr.cast(DoubleType()) / (basedf.per.cast(DoubleType())), 2))
+
+
+basedf = basedf.withColumn('per', basedf.per * basedf.weight_rate_to_apply)
+
+#for testing LB
+basedf_test_df = DynamicFrame.fromDF(basedf, glueContext,"basedf_test_df" )
+datasink9 = glueContext.write_dynamic_frame.from_options(frame = basedf_test_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/basedf_test_df"}, format = "parquet", transformation_ctx = "datasink8")
+
+
+basedf = basedf.selectExpr('kunag', 'inco1', 'inco2', 'matnr', 'vkorg', 'valid_to', 'valid_from', 'uom', 'uom_scale', 'per', 'scales_qty', 'konwa', 'kbetr', 'valid_price_base_currency', 'kstbm', 'ibg', 'cust_region', 'weight_rate_to_apply_scale', 'weight_rate_to_apply', 'cond_type', 'type1', 'type2').coalesce(1)
+
+
+
+del konp
+del konm
+
+print(basedf.columns)
+
+print("\n 1 \n")
+
+df = basedf.toPandas()
+print("\n 2 \n")
+
+df = df[['kunag', 'matnr', 'cust_region', 'ibg', 'inco1', 'scales_qty']]
+print(df.dtypes)
+
+print("\n A \n")
+
+df['scales_qty'] = pd.to_numeric(df['scales_qty'])
+
+print("\n B \n")
+
+
+df['kunag'] = df['kunag'].fillna("")
+
+df['matnr'] = df['matnr'].fillna("")
+
+df['ibg'] = df['ibg'].fillna("")
+
+df['inco1'] = df['inco1'].fillna("")
+
+
+#[df[col].fillna("", inplace=True) for col in df.columns if (df[col].dtype == object)]
+
+print("\n C \n")
+
+
+df['cust_region'] = df['cust_region'].fillna("")
+
+print("\n D \n")
+
+df['ibg'] = df['ibg'].fillna("")
+print("\n E \n")
+
+df = df.sort_values(by=['kunag', 'matnr', 'cust_region', 'ibg', 'inco1', 'scales_qty'])
+
+df = df.drop_duplicates(subset=['kunag', 'matnr', 'cust_region', 'ibg', 'inco1', 'scales_qty'])
+
+df['max_vol'] = df.groupby(['kunag', 'matnr', 'cust_region', 'ibg', 'inco1'])['scales_qty'].shift(-1)
+
+print(df.head(10))
+print("\n  \n")
+print(df.dtypes)
+df['max_vol'] = df['max_vol'].fillna(1000000000000.0)	
+
+print("\n  \n")
+print(df.head(10))
+
+print("\n  \n")
+print(df.dtypes)
+
+basedf_maxvol = spark.createDataFrame(df)
+
+
+basedf_maxvol_df = basedf_maxvol.repartition(1)
+#basedf_maxvol_df = DynamicFrame.fromDF(basedf_maxvol_df, glueContext,"basedf_maxvol_df" )
+#datasink8 = glueContext.write_dynamic_frame.from_options(frame = basedf_maxvol_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/test"}, format = "parquet", transformation_ctx = "datasink8")
+
+basedf = basedf.join(broadcast(basedf_maxvol), ['kunag', 'matnr', 'cust_region', 'ibg', 'inco1', 'scales_qty'] ,'left')
+
+print("max vol \n")
+#print(basedf.select("kunag").count())
+
+print("passed")
+
+del df
+basedPdf = basedf.select('kunag', 'matnr', 'inco1').toPandas()
+basedPdf['temp'] = 0 
+
+ids_df = basedPdf.groupby(['kunag', 'matnr', 'inco1']).agg({'temp': 'sum'}).reset_index()
+ids_df['unique_id'] = ids_df.index + 880
+ids_df = ids_df[['unique_id', 'kunag', 'matnr', 'inco1']]
+
+del basedPdf
+
+
+ids = spark.createDataFrame(ids_df)
+
+
+basedf = basedf.join(broadcast(ids), ['kunag', 'matnr', 'inco1'] ,'left')
+print("idss \n")
+print(basedf.select("kunag").count())
+
+print("\n 3 \n")
+
+print("\n 4 \n")
+
+
+
+print("\n 5 \n")
+
+basedf = basedf.join(broadcast(fx_rate), "konwa", 'left')
+
+print("fx_rate \n")
+print(basedf.select("kunag").count())
+
+print("\n 6 \n")
+
+
+basedf = basedf.withColumn('scales_rate', basedf.kbetr.cast(DoubleType()) / basedf.per.cast(DoubleType()))
+
+basedf = basedf.withColumn("fx_rate_into_eur", when(basedf.konwa == 'EUR', 1.0).otherwise(basedf.fx_rate_into_eur))
+
+basedf = basedf.withColumn("scales_rate", when(col("konwa") == 'EUR', col("scales_rate").cast(DoubleType())).otherwise(col("scales_rate").cast(DoubleType()) * col("fx_rate_into_eur").cast(DoubleType())))
+
+
+print("\n 7 \n")
+
+print("dates")
+
+now = current_timestamp() #pd.to_datetime("now")
+
+print("TIMESS")
+
+basedf.select("valid_from", "valid_to").show(10)
+
+
+basedf = basedf.withColumn("valid_from", to_date(basedf.valid_from, "yyyy-MM-dd"))
+basedf = basedf.withColumn("valid_to", to_date(basedf.valid_to, "yyyy-MM-dd"))
+
+future_basedf = basedf.select("kunag", "matnr", "vkorg", "inco1", "valid_from", "valid_to", "valid_price_base_currency")
+future_basedf = future_basedf.filter(((future_basedf.valid_from > now) & (future_basedf.valid_to > now)))
+future_basedf = future_basedf.sort(future_basedf.valid_from.asc()).coalesce(1)
+future_basedf = future_basedf.drop_duplicates(["kunag", "matnr", "vkorg", "inco1"])
+future_basedf = future_basedf.withColumnRenamed("valid_from", "future_valid_from")
+future_basedf = future_basedf.withColumnRenamed("valid_to", "future_valid_to")
+future_basedf = future_basedf.withColumnRenamed("valid_price_base_currency", "future_valid_price")
+
+previous_basedf = basedf.select("kunag", "matnr", "vkorg", "inco1", "valid_from", "valid_to", "valid_price_base_currency")
+previous_basedf = previous_basedf.filter(((previous_basedf.valid_from < now) & (previous_basedf.valid_to < now)))
+previous_basedf = previous_basedf.sort(previous_basedf.valid_to.desc()).coalesce(1)
+previous_basedf = previous_basedf.drop_duplicates(["kunag", "matnr", "vkorg", "inco1"])
+previous_basedf = previous_basedf.withColumnRenamed("valid_from", "previous_valid_from")
+previous_basedf = previous_basedf.withColumnRenamed("valid_to", "previous_valid_to")
+previous_basedf = previous_basedf.withColumnRenamed("valid_price_base_currency", "previous_valid_price")
+
+basedf = basedf.join(broadcast(future_basedf), ["kunag", "matnr", "vkorg", "inco1"], 'left')
+basedf = basedf.join(broadcast(previous_basedf), ["kunag", "matnr", "vkorg", "inco1"], 'left')
+
+
+basedf = basedf.withColumn("scale_type", when((basedf.valid_from > now) & (basedf.valid_to > now),"Future")
+                                 .when((basedf.valid_from < now) & (basedf.valid_to < now),"Past")
+                                 .otherwise("Current"))
+
+
+basedf = basedf.withColumn("per", lit(1))
+
+print("\n 9 \n")
+
+
+
+basedf = basedf.sort(basedf.kunag.asc(), basedf.matnr.asc(), basedf.cust_region.asc(), basedf.ibg.asc(), basedf.scales_qty.asc())
+
+
+print("\n 11 \n")
+
+
+print("end")
+
+
+basedf = basedf.withColumn('upload_date', current_timestamp())
+basedf = basedf.withColumn('currency_output', lit("EUR"))
+basedf = basedf.withColumn('uom_output', lit("KG"))
+
+#print(basedf.count())
+
+#basedf.select("valid_from", "valid_to").show(10)
+
+
+
+basedf = basedf.withColumn('source_system', lit("cxp_scale_rate_qty_mendix"))
+print(basedf.dtypes)
+price_scale = basedf.selectExpr("unique_id", "kunag as cust_number", "matnr as prod_number", "vkorg as sales_org", "scales_qty", "max_vol", "valid_from","valid_to", "valid_price_base_currency as scales_rate", "future_valid_from", "future_valid_to", "future_valid_price", "previous_valid_from", "previous_valid_to", "previous_valid_price", "inco1 as incoterm1", "inco2 as incoterm2", "scale_type", "uom", "uom_scale", "konwa as currency", "upload_date", "source_system")
+#price_scale = price_scale.repartition(1)
+print('price_scale')
+price_scale_df = DynamicFrame.fromDF(price_scale, glueContext, "cxp_scale_rate_qty_mendix" )
+datasink2 = glueContext.write_dynamic_frame.from_options(frame = price_scale_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_3_3_cxp_scale_rate_qty_mendix"}, format = "parquet", transformation_ctx = "datasink2")
+
+del price_scale
+
+basedf = basedf.withColumn('source_system', lit("cxp_master"))
+basedf = basedf.withColumn('scales_qty', basedf.scales_qty * basedf.weight_rate_to_apply_scale)
+basedf = basedf.withColumn('max_vol', basedf.max_vol * basedf.weight_rate_to_apply_scale)
+
+
+masterdf = basedf.selectExpr("unique_id", "kunag as cust_number", "matnr as prod_number", "vkorg as sales_org", "scales_qty", "max_vol", "valid_from","valid_to", "scales_rate", "future_valid_from", "future_valid_to", "future_valid_price", "previous_valid_from", "previous_valid_to", "previous_valid_price", "inco1 as incoterm1", "inco2 as incoterm2", "scale_type", "konwa as currency", "per", "uom", "valid_price_base_currency", "currency_output", "uom_output","weight_rate_to_apply", "fx_rate_into_eur", 'cond_type', 'type1', 'type2', "upload_date", "source_system")
+
+#masterdf = masterdf.repartition(1)
+master_df = DynamicFrame.fromDF(masterdf, glueContext,"master_df" )
+datasink1 = glueContext.write_dynamic_frame.from_options(frame = master_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_3_7_cxp_master"}, format = "parquet", transformation_ctx = "datasink1")
+
+del masterdf
+
+
+#basedf = basedf.withColumn('source_system', lit("cxp_hist_scale_rate_qty_mendix"))
+# print('historic_scale')
+#history = basedf.selectExpr("unique_id", "kunag as customer", "matnr as material",  "inco1 as incoterm1", "inco2 as incoterm2", "valid_from","valid_to", "scales_rate", "upload_date", "source_system")
+# #history = history.repartition(1)
+#cxp_hist_scale_rate_qty_mendix_df = DynamicFrame.fromDF(history, glueContext,"cxp_hist_scale_rate_qty_mendix_df" )
+#datasink4 = glueContext.write_dynamic_frame.from_options(frame = cxp_hist_scale_rate_qty_mendix_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_3_1_cxp_hist_scale_rate_qty_mendix"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+job.commit()
+
+
+
+
+
+
+

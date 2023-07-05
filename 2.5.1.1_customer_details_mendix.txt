@@ -1,0 +1,445 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from datetime import datetime
+
+#args = getResolvedOptions(sys.argv, ['DatabaseName']) 
+
+#Convert table names to lower case
+#args["DatabaseName"] = args["DatabaseName"].lower() 
+
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_1_3_mapping_sales_officer_cwid/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_1_1_customer_details_mendix/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_5_1_4_customer_details_mendix_data_check/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key']) 
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+
+knvv  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_knvv", transformation_ctx = "datasource0")
+tvkgr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_tvkgr", transformation_ctx = "datasource0")
+kna1  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_kna1", transformation_ctx = "datasource1")
+adrc  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_adrc", transformation_ctx = "datasource2")
+t005t  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_t005t", transformation_ctx = "datasource3")
+t171  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_t171", transformation_ctx = "datasource4")
+#t151  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_t151", transformation_ctx = "datasource14")
+tvbur  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_tvbur", transformation_ctx = "datasource5")
+cust_size  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_1_cust_desc_cust_group_adj_cust_segment", transformation_ctx = "datasource6")
+country_grp  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_6_mapping_region_country_group", transformation_ctx = "datasource7")
+# acc_mgr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_14_mapping_accountmanager_input", transformation_ctx = "datasource8")
+order_cost  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_13_mapping_order_cost", transformation_ctx = "datasource9")
+email = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_22_mapping_sales_officers_cwid_to_email", transformation_ctx = "datasource10")
+tcurr  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_tcurr", transformation_ctx = "datasource11")
+tcurx  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_tcurx", transformation_ctx = "datasource12")
+cust_grp_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_23_mapping_customers_to_customer_group_and_ml2", transformation_ctx = "datasource13")
+cov_md_seg  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_cov_md_segment", transformation_ctx = "datasource14")
+fx_rate  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_4_3_mapping_fx_rate", transformation_ctx = "datasource15")
+sales_org = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_24_mapping_thresholds_salesorg", transformation_ctx = "datasource8")
+thresh_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_3_mapping_thresholds_ml2", transformation_ctx = "datasource11")
+bw_data  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_2_bw_transaction_data", transformation_ctx = "datasource80")
+
+thresh_ml2 = thresh_ml2.toDF().selectExpr("marketing_level_2 as ibg", "sbe as bu_scope")
+thresh_ml2 = thresh_ml2.withColumn("ibg", thresh_ml2.ibg.cast(StringType()))
+
+
+sales_org = sales_org.toDF()
+sales_org = sales_org.select("sales_org_id").distinct()
+sales_org = sales_org.withColumn("sales_org_id",col("sales_org_id").cast(StringType()))
+sales_org = sales_org.toPandas()
+sales_org = sales_org['sales_org_id'].tolist()
+
+bw_data = bw_data.toDF()
+bw_data = bw_data.withColumnRenamed("sold_to_party", "kunnr")
+bw_data = bw_data.withColumnRenamed("marketing_level_2", "ibg1")
+bw_data = bw_data.withColumnRenamed("fiscal_year", "fiscal_year")
+bw_data = bw_data.withColumnRenamed("posting_period", "month")
+bw_data = bw_data.withColumnRenamed("marketing_customer_sold_to", "cust_grp_adj1")
+
+bw_data = bw_data.withColumn('kunnr', lpad(bw_data.kunnr.cast(StringType()), 10, '0'))
+bw_data = bw_data.withColumn("ibg1", bw_data.ibg1.cast(StringType()))
+bw_data = bw_data.filter(bw_data.ibg1 != "#")
+
+
+bw_data = bw_data.select("kunnr", "ibg1", "cust_grp_adj1", "fiscal_year", "month")
+
+bw_data = bw_data.sort(bw_data.kunnr, bw_data.fiscal_year.desc(), bw_data.month.desc()).coalesce(1)
+
+bw_data = bw_data.drop_duplicates(["kunnr"])
+bw_data = bw_data.select("kunnr", "ibg1", "cust_grp_adj1")
+
+cov_md_seg = cov_md_seg.toDF().selectExpr("segment", "description as cust_classification")
+knvv = knvv.toDF().selectExpr("kdgrp","kunnr","kztlf", "zterm", "waers", "kalks", "vkorg", "vkbur", "vkgrp", "inco1", "inco2", "bzirk", "loevm")
+kna1 = kna1.toDF().withColumnRenamed("/cov/md_segm", "segment").selectExpr("name1 as cust_descrp", "land1", "kunnr", "adrnr", "segment", "ktokd", "loevm as loevm_kna1")
+
+adrc = adrc.toDF().selectExpr("addrnumber as adrnr", "name1 as cust_descrp_chi", "nation")
+adrc = adrc.filter(adrc.nation == "C")
+adrc = adrc.withColumn("land1", lit("CN"))
+t005t = t005t.toDF().select("landx","land1")
+#t171 = t171.toDF().selectExpr('BZIRK as bzirk', 'BZTXT as bztxt', 'NAME_FIRST as name_first', 'NAME_LAST as name_last')
+t171 = t171.toDF().selectExpr('BZIRK as bzirk', 'BZTXT as account_mgr', 'NAME_FIRST as name_first', 'NAME_LAST as name_last')
+
+#t171 = t171.select("account_mgr","name_first", "name_last", "bzirk")
+#t171 = t171.select(concat_ws(' ',t171.name_first,t171.name_last).alias("account_mgr_name"),"account_mgr","bzirk")
+
+t171 = t171.select("account_mgr", "bzirk")
+
+#t151 = t151.toDF().selectExpr("kdgrp","ktext as cust_grp_adj")
+tvbur = tvbur.toDF().selectExpr("adrnr as kunnr", "vkbur")
+cust_size = cust_size.toDF().selectExpr("cust_segment", "cust_grp_adj")
+cust_size = cust_size.drop_duplicates(['cust_grp_adj'])
+country_grp = country_grp.toDF().selectExpr("country_group as country_grp", "land as land1", "region_text as cust_region")
+country_grp = country_grp.drop_duplicates(['land1'])
+
+
+# acc_mgr = acc_mgr.toDF().selectExpr("ml2 as ibg", "region as cust_region", "customer as kunnr", "customer_group_adjusted as cust_grp_adj", "sales_org as vkorg", "type", "am_system as account_mgr", "am_responsible")
+order_cost = order_cost.toDF().selectExpr("charge as order_cost_eur", "region as cust_region")
+email = email.toDF().selectExpr("sales_off", "sales_off_email")
+
+fx_rate = fx_rate.toDF().selectExpr('from_currency as waers', 'to_currency', 'exchange_rate')
+tvkgr = tvkgr.toDF().selectExpr('BEZEI as sales_off', 'VKGRP as vkgrp', 'NAME_FIRST as name_first', 'NAME_LAST as name_last')
+tvkgr = tvkgr.select(concat(tvkgr.name_first, lit(" "), tvkgr.name_last).alias("sales_off_descrp"), "sales_off", "vkgrp")
+
+cust_grp_ml2 = cust_grp_ml2.toDF().selectExpr("customer_sold_to as kunnr", "marketing_customer_ship_to_description as cust_grp_adj2", "marketing_customer_ship_to as cust_grp_adj_id", "ml2 as ibg2")
+cust_grp_ml2 = cust_grp_ml2.filter(cust_grp_ml2.kunnr != '0000000000')
+cust_grp_ml2 = cust_grp_ml2.withColumn("ibg2", cust_grp_ml2.ibg2.cast(StringType()))
+cust_grp_ml2 = cust_grp_ml2.drop_duplicates(["kunnr"])
+
+#cust_grp_ml2 = cust_grp_ml2.filter(cust_grp_ml2.ibg2 != 'nan')
+
+fx_rate = fx_rate.filter(fx_rate.to_currency == 'EUR')
+
+print("knvv \n")
+print(knvv.select("kunnr").count())
+
+bw_data = bw_data.withColumn('ibg_type1', lit("bw"))
+cust_grp_ml2 = cust_grp_ml2.withColumn('ibg_type2', lit("cust_grp_ml2"))
+
+knvv = knvv.join(broadcast(bw_data), "kunnr" ,'left')
+knvv = knvv.join(broadcast(cust_grp_ml2), "kunnr" ,'left')
+
+
+knvv = knvv.withColumn('ibg', when(((isnan(knvv.ibg1)) | knvv.ibg1.isNull()), knvv.ibg2).otherwise(knvv.ibg1))
+knvv = knvv.withColumn('cust_grp_adj', when(((isnan(knvv.cust_grp_adj1)) | knvv.cust_grp_adj1.isNull()), knvv.cust_grp_adj2).otherwise(knvv.cust_grp_adj1))
+knvv = knvv.withColumn('ibg_type', when(((isnan(knvv.ibg_type1)) | knvv.ibg_type1.isNull()), knvv.ibg_type2).otherwise(knvv.ibg_type1))
+
+print("\n \n IBG filters \n \n")
+
+knvv = knvv.filter(knvv.ibg.isNotNull())
+
+knvv = knvv.filter(knvv.ibg != 'nan')
+
+#knvv = knvv.drop("ibg1", "ibg2", "cust_grp_adj1", "cust_grp_adj2")
+knvv = knvv.drop("ibg1", "cust_grp_adj1", "ibg_type1", "ibg2", "cust_grp_adj2", "ibg_type2")
+
+knvv = knvv.join(broadcast(thresh_ml2), "ibg",'left')
+
+knvv = knvv.filter(knvv.bu_scope != "Out of scope")
+
+
+print("cust_grp_ml2 \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.join(broadcast(kna1), "kunnr" , 'left')
+print("kna1 \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.filter(knvv.ktokd == "0001")
+knvv = knvv.filter(knvv.loevm != "X")
+knvv = knvv.filter(knvv.loevm_kna1 != "X")
+
+print(len(set(knvv.select("kunnr").distinct().toPandas()['kunnr'].tolist()).difference(set(bw_data.select("kunnr").distinct().toPandas()['kunnr'].tolist()))))
+
+knvv = knvv.join(broadcast(cov_md_seg), "segment" ,'left')
+print("cov_md_seg \n")
+print(knvv.select("kunnr").count())
+
+
+knvv = knvv.join(broadcast(adrc), ["adrnr", "land1"] ,'left')
+print("adrc \n")
+print(knvv.select("kunnr").count())
+
+
+knvv = knvv.join(broadcast(t005t), "land1" ,'left')
+
+print("t005t \n")
+print(knvv.select("kunnr").count())
+
+
+knvv = knvv.join(broadcast(t171), "bzirk" ,'left')
+print("t171 \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.join(broadcast(tvkgr), "vkgrp" ,'left')
+print("tvkgr \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.join(broadcast(cust_size), "cust_grp_adj", 'left')
+print("cust_size \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.join(broadcast(country_grp), "land1", 'left')
+print("country_grp \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.join(broadcast(order_cost), "cust_region", 'left')
+print("order_cost \n")
+print(knvv.select("kunnr").count())
+
+
+knvv = knvv.join(broadcast(fx_rate), "waers", 'left')
+print("fx_rate \n")
+print(knvv.select("kunnr").count())
+
+
+knvv = knvv.withColumn("order_cost_base_currency", when(col("waers") == 'EUR', col("order_cost_eur").cast(DoubleType())).otherwise(col("order_cost_eur").cast(DoubleType()) / col("exchange_rate").cast(DoubleType())))
+
+knvv = knvv.join(broadcast(email), "sales_off", "left")
+print("email \n")
+print(knvv.select("kunnr").count())
+
+knvv = knvv.withColumn("cust_grp_adj_id", lit(" "))
+
+
+### AM SWAP
+#acc_mgr = acc_mgr.toDF().selectExpr("ibg", "cust_region", "kunnr", "cust_grp_adj", "vkorg", "type", "am_system", "am_responsible")
+
+knvv = knvv.withColumn("old_am", knvv.account_mgr)
+
+# knvv = knvv.join(acc_mgr.select("account_mgr", "am_responsible").drop_duplicates(), ["account_mgr"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+# knvv = knvv.join(broadcast(acc_mgr.select("ibg", "cust_region", "kunnr", "am_responsible").drop_duplicates()), ["ibg", "cust_region", "kunnr"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+# knvv = knvv.join(broadcast(acc_mgr.select("ibg", "cust_region", "cust_grp_adj", "kunnr", "am_responsible").drop_duplicates()), ["ibg", "cust_region", "cust_grp_adj", "kunnr"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+# knvv = knvv.join(broadcast(acc_mgr.select("kunnr", "cust_region", "cust_grp_adj", "am_responsible").drop_duplicates()), ["kunnr", "cust_region", "cust_grp_adj"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+# knvv = knvv.join(broadcast(acc_mgr.select("cust_region", "kunnr", "am_responsible").drop_duplicates()), ["cust_region", "kunnr"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+# knvv = knvv.join(broadcast(acc_mgr.select("ibg", "cust_region", "kunnr", "vkorg", "am_responsible").drop_duplicates()), ["ibg", "cust_region", "kunnr", "vkorg"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+
+# knvv = knvv.join(acc_mgr.select("ibg", "cust_region", "account_mgr", "am_responsible").drop_duplicates(), ["ibg", "cust_region", "account_mgr"], "left")
+
+# knvv = knvv.withColumn("account_mgr", when(knvv.am_responsible.isNull(), knvv.account_mgr).otherwise(knvv.am_responsible))
+# knvv = knvv.drop("am_responsible")
+
+
+
+
+knvv = knvv.selectExpr("kunnr", "cust_descrp_chi", "cust_descrp", "cust_grp_adj_id", "cust_grp_adj", "country_grp", "order_cost_eur", "order_cost_base_currency","exchange_rate", \
+"cust_segment as cust_size", "kunnr as cust_number", "landx as country_soldto", "cust_classification", "old_am", "account_mgr", "ibg", "ibg_type",\
+"zterm as cust_payment_term", "waers as base_currency", "vkorg as sales_org", "cust_region", \
+"sales_off", "sales_off_descrp", "inco1 as incoterm1", "inco2 as incoterm2", "sales_off_email")
+
+knvv = knvv.withColumn('base_unit', lit(None).cast(StringType()))
+knvv = knvv.withColumn('average_reb_kg_eur', lit(0.0).cast(StringType()))
+knvv = knvv.withColumn('average_frght_kg_eur', lit(0.0).cast(StringType()))
+knvv = knvv.withColumn('average_com_kg_eur', lit(0.0).cast(StringType()))
+
+knvv = knvv.withColumn('condition_type', lit("YP00").cast(StringType()))
+
+knvv = knvv.withColumn('upload_date', current_timestamp())
+knvv = knvv.withColumn('source_system', lit("customer_details_mendix"))
+
+knvv = knvv.withColumn('incoterm1', when(col('incoterm1') == '', None).otherwise(col('incoterm1')))
+knvv = knvv.withColumn('incoterm2', when(col('incoterm2') == '', None).otherwise(col('incoterm2')))
+knvv = knvv.withColumn('cust_payment_term', when(col('cust_payment_term') == '', None).otherwise(col('cust_payment_term')))
+knvv = knvv.withColumn('cust_grp_adj', when(col('cust_grp_adj') == '', None).otherwise(col('cust_grp_adj')))
+knvv = knvv.withColumn('cust_size', when(col('cust_size') == '', None).otherwise(col('cust_size')))
+
+
+
+
+knvv = knvv.withColumn("sales_org", col("sales_org").cast(StringType()))
+
+
+knvv = knvv.filter(knvv.sales_org.isin(sales_org))
+print(knvv.select("kunnr").count())
+
+knvv = knvv.withColumn('sales_off', when(knvv.sales_off == "SALESGROUP GLOBAL", knvv.sales_off).otherwise(split(knvv.sales_off, ' ').getItem(0)))
+knvv = knvv.withColumn('sales_off', when(knvv.sales_off == "SALESGROUP GLOBAL", knvv.sales_off).otherwise(split(knvv.sales_off, '_').getItem(0)))
+knvv = knvv.withColumn('sales_off', when(knvv.sales_off == "SALESGROUP GLOBAL", knvv.sales_off).otherwise(split(knvv.sales_off, ',').getItem(0)))
+
+print('&' * 40)
+                                             
+
+
+knvv = knvv.drop_duplicates()
+
+knvv = knvv.select("cust_grp_adj_id", "cust_grp_adj", "cust_size",	"cust_number", "cust_descrp", \
+"cust_descrp_chi", "country_soldto", "country_grp", "cust_classification", "old_am", "account_mgr", "ibg", "ibg_type", "cust_region",	"order_cost_eur", "cust_payment_term",	"base_currency", "base_unit",\
+"condition_type", "order_cost_base_currency", "sales_org", "sales_off", "sales_off_descrp",	\
+"sales_off_email",	"incoterm1", "incoterm2", "average_reb_kg_eur", "average_frght_kg_eur", "average_com_kg_eur", "upload_date", "source_system")
+
+print('*' * 30)
+
+print(knvv.dtypes)
+
+knvvPD = knvv.toPandas()
+
+print("\n 1 \n")
+
+
+print("start")
+
+knvvPD = knvvPD[knvvPD['sales_off_email'].isnull()]
+print(knvvPD.columns)
+knvvPD = knvvPD[["sales_off", "sales_off_descrp", "sales_off_email"]]
+
+knvvPD = knvvPD.assign(sales_off_email = '')
+print(knvvPD.dtypes)
+
+
+email_off = spark.createDataFrame(knvvPD) 
+
+email_off = email_off.select("sales_off", "sales_off_descrp", "sales_off_email")
+
+email_off = email_off.withColumn('upload_date', current_timestamp())
+email_off = email_off.withColumn('source_system', lit("mapping_sales_off_cwid"))
+
+#datacheck customer details
+data_check = knvv.filter((knvv.account_mgr == "#") |
+                               (knvv.cust_number.isNull()) | 
+                               (knvv.cust_descrp.isNull()) | 
+                               (knvv.cust_grp_adj.isNull()) | 
+                               (knvv.cust_grp_adj_id.isNull()) | 
+                               (knvv.cust_size.isNull()) | 
+                               (knvv.country_soldto.isNull()) | 
+                               (knvv.country_grp.isNull()) | 
+                               (knvv.cust_region.isNull()) | 
+                               (knvv.ibg.isNull()) | 
+                               (knvv.cust_classification.isNull()) | 
+                               (knvv.order_cost_eur.isNull()) | 
+                               (knvv.cust_payment_term.isNull()) |
+                               (knvv.base_currency.isNull()) | 
+                               (knvv.base_unit.isNull()) | 
+                               (knvv.condition_type.isNull()) | 
+                               (knvv.order_cost_base_currency.isNull()) | 
+                               (knvv.sales_org == '#') | 
+                               (knvv.sales_off.isNull()) | 
+                               (knvv.sales_off_descrp.isNull()) | 
+                               (knvv.incoterm2.isNull()) | 
+                               (knvv.sales_off_email.isNull()) | 
+                               (knvv.incoterm1.isNull()) |
+                               (isnan(knvv.average_reb_kg_eur)) | 
+                               (isnan(knvv.average_frght_kg_eur)) | 
+                               (isnan(knvv.average_com_kg_eur))
+                               )
+
+data_check = data_check.withColumn("remarks", 
+                               when((knvv.cust_number.isNull()), lit("cust_number")).when((knvv.account_mgr == "#"), lit("account mgr = #")) \
+                               .when((knvv.cust_descrp.isNull()), lit("cust_descrp")) \
+                               .when((knvv.cust_grp_adj.isNull()) , lit("cust_grp_adj")) \
+                               .when((knvv.cust_grp_adj_id.isNull()), lit("cust_grp_adj_id")) \
+                               .when((knvv.cust_size.isNull()), lit("cust_size")) \
+                               .when((knvv.country_soldto.isNull()), lit("country_soldto")) \
+                               .when((knvv.country_grp.isNull()), lit("country_grp")) \
+                               .when((knvv.cust_region.isNull()), lit("cust_region"))\
+                               .when((knvv.ibg.isNull()), lit("ibg")) \
+                               .when((knvv.cust_classification.isNull()), lit("cust_classification")) \
+                               .when((knvv.order_cost_eur.isNull()), lit("order_cost_eur")) \
+                               .when((knvv.cust_payment_term.isNull()), lit("cust_payment_term")) \
+                               .when((knvv.base_currency.isNull()), lit("base_currency")) \
+                               .when((knvv.base_unit.isNull()), lit("base_unit")) \
+                               .when((knvv.condition_type.isNull()), lit("condition_type")) \
+                               .when((knvv.order_cost_base_currency.isNull()), lit("order_cost_base_currency")) \
+                               .when((knvv.sales_org == '#'), lit("sales_org == #")) \
+                               .when((knvv.sales_off.isNull()), lit("sales_off")) \
+                               .when((knvv.sales_off_descrp.isNull()), lit("sales_off_descrp")) \
+                               .when((knvv.incoterm2.isNull()), lit("incoterm2")) \
+                               .when((knvv.sales_off_email.isNull()), lit("sales_off_email")) \
+                               .when((knvv.incoterm1.isNull()), lit("incoterm1")) \
+                               .when(isnan(knvv.average_reb_kg_eur), lit("average_reb_kg_eur")) \
+                               .when(isnan(knvv.average_frght_kg_eur), lit("average_frght_kg_eur")) \
+                               .when(isnan(knvv.average_com_kg_eur), lit("average_com_kg_eur")) \
+                               )
+
+
+print(data_check.select("cust_number").count())
+
+cust_details_df = DynamicFrame.fromDF(knvv, glueContext,"cust_details_df" )
+email_off_df = DynamicFrame.fromDF(email_off, glueContext,"email_off_df" )
+data_check_df = DynamicFrame.fromDF(data_check, glueContext,"data_check_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = cust_details_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_1_1_customer_details_mendix"}, format = "parquet", transformation_ctx = "datasink4")
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = email_off_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_1_3_mapping_sales_officer_cwid"}, format = "parquet", transformation_ctx = "datasink4")
+
+datasink0 = glueContext.write_dynamic_frame.from_options(frame = data_check_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_5_1_4_customer_details_mendix_data_check"}, format = "parquet", transformation_ctx = "datasink0")
+
+
+job.commit()
+
+
+
+
+
+
+

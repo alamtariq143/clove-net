@@ -1,0 +1,236 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+
+#args = getResolvedOptions(sys.argv, ['DatabaseName']) 
+
+#Convert table names to lower case
+#args["DatabaseName"] = args["DatabaseName"].lower() 
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+s3_client = boto3.client('s3')
+
+BUCKET = 'cap-qa-data-lake'
+PREFIX = 'pricing-app/processed/analytical_layer/al_3_2_5_customer_details_mendix/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+
+
+list_complete  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "al_3_2_2_list_complete", transformation_ctx = "datasource00")
+cust_details  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_1_1_customer_details_mendix", transformation_ctx = "datasource0")
+price_master = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_3_7_cxp_master", transformation_ctx = "datasource0")
+
+
+list_complete = list_complete.toDF()
+
+list_complete = list_complete.fillna(0.0, subset=['reb_kg_eur', 'frght_kg_eur', 'othvse_kg_eur'])
+
+
+cust_details = cust_details.toDF()
+
+price_master = price_master.toDF()
+
+
+
+### Check this with Vasu
+cxp_cond_type = price_master.filter(price_master.scale_type == "Current").selectExpr("cust_number", "valid_from", "cond_type as condition_type", "scales_rate")
+cxp_cond_type = cxp_cond_type.withColumn("valid_from", to_date(cxp_cond_type.valid_from, "yyyy-MM-dd"))
+
+cxp_cond_type_count = cxp_cond_type.groupBy("cust_number", "condition_type").agg(count('scales_rate').alias("cond_count"))
+
+cxp_cond_type = cxp_cond_type.join(cxp_cond_type_count, ["cust_number", "condition_type"], "left")
+
+cxp_cond_type = cxp_cond_type.sort(cxp_cond_type.valid_from.desc(), cxp_cond_type.cond_count.desc())
+cxp_cond_type = cxp_cond_type.drop_duplicates(["cust_number"]).selectExpr("cust_number", "condition_type as condition_type1")
+
+del cxp_cond_type_count
+
+
+cxp_cond_type2 = price_master.filter(price_master.scale_type == "Past").selectExpr("cust_number", "valid_from", "cond_type as condition_type", "scales_rate")
+cxp_cond_type2 = cxp_cond_type2.withColumn("valid_from", to_date(cxp_cond_type2.valid_from, "yyyy-MM-dd"))
+
+cxp_cond_type_count = cxp_cond_type2.groupBy("cust_number", "condition_type").agg(count('scales_rate').alias("cond_count"))
+
+cxp_cond_type2 = cxp_cond_type2.join(cxp_cond_type_count, ["cust_number", "condition_type"], "left")
+
+cxp_cond_type2 = cxp_cond_type2.sort(cxp_cond_type2.valid_from.desc(), cxp_cond_type2.cond_count.desc())
+cxp_cond_type2 = cxp_cond_type2.drop_duplicates(["cust_number"]).selectExpr("cust_number", "condition_type as condition_type2")
+
+price_master = price_master.selectExpr("cust_number", "sales_org", "valid_from", "uom as base_unit")
+price_master = price_master.withColumn("valid_from", to_date(price_master.valid_from, "yyyy-MM-dd"))
+price_master = price_master.sort(price_master.valid_from.desc())
+
+
+price_master = price_master.drop_duplicates(["cust_number", "sales_org"])
+price_master2 = price_master.drop_duplicates(["cust_number"])
+price_master2 = price_master2.drop("valid_from", "sales_org")
+price_master = price_master.drop("valid_from")
+price_master2 = price_master2.withColumnRenamed("base_unit", "base_unit2")
+price_master = price_master.withColumnRenamed("base_unit", "base_unit1")
+
+price_master.show()
+price_master2.show()
+
+print("\n \n 1 \n")
+print(cust_details.count())
+
+cust_details = cust_details.drop("upload_date", "source_system")
+cust_details = cust_details.drop_duplicates()
+
+list_complete.groupBy("ibg").count().show()
+
+cust_details = cust_details.withColumn("temp", concat(cust_details.cust_number, cust_details.cust_region, cust_details.sales_org)) 
+list_complete = list_complete.withColumn("temp", concat(list_complete.cust_number, list_complete.cxp_region, list_complete.sales_org)) 
+
+cust_details.select('cust_number').intersect(list_complete.select('cust_number')).show()
+cust_details.select('cust_region').intersect(list_complete.select('cxp_region')).show() 
+cust_details.select('ibg').intersect(list_complete.select('ibg_descrp')).show() 
+cust_details.select('sales_org').intersect(list_complete.select('sales_org')).show() 
+cust_details.select('temp').intersect(list_complete.select('temp')).show() 
+
+
+
+list_complete = list_complete.filter((list_complete.valid_price_kg_eur.isNull()) | (list_complete.last_transaction_per_cxp == "Yes"))
+list_complete = list_complete.select('cust_number', 'cxp_region', 'ibg_descrp', 'sales_org', 'frght_kg_eur', 'reb_kg_eur', 'othvse_kg_eur', 'transactional_vol_kg', 'transaction_date')
+list_complete = list_complete.withColumnRenamed("ibg_descrp", "ibg")
+
+
+list_complete = list_complete.withColumn("month_diff", round(months_between(current_date(), list_complete.transaction_date)))
+
+list_comp_6_month = list_complete.filter(list_complete.month_diff <= 6.0)
+
+list_comp_6_month = list_comp_6_month.withColumn("total_reb", list_comp_6_month.reb_kg_eur * list_comp_6_month.transactional_vol_kg)
+list_comp_6_month = list_comp_6_month.withColumn("total_frght", list_comp_6_month.frght_kg_eur * list_comp_6_month.transactional_vol_kg)
+list_comp_6_month = list_comp_6_month.withColumn("total_com", list_comp_6_month.othvse_kg_eur * list_comp_6_month.transactional_vol_kg)
+
+list_comp_6_month = list_comp_6_month.groupBy('cust_number', 'cxp_region', 'sales_org').agg(sum("total_reb").alias("sum_total_reb"), sum("total_frght").alias("sum_total_frght"), sum("total_com").alias("sum_total_com"), sum("transactional_vol_kg").alias("sum_total_vol"))
+
+list_comp_6_month.groupBy("sum_total_reb").count().show()
+
+list_comp_6_month = list_comp_6_month.withColumn("avg_reb1", round((list_comp_6_month.sum_total_reb / list_comp_6_month.sum_total_vol), 2))
+list_comp_6_month = list_comp_6_month.withColumn("avg_frght1", round((list_comp_6_month.sum_total_frght / list_comp_6_month.sum_total_vol), 2))
+list_comp_6_month = list_comp_6_month.withColumn("avg_com1", round((list_comp_6_month.sum_total_com / list_comp_6_month.sum_total_vol), 2))
+
+list_comp_6_month.groupBy("avg_reb1").count().show()
+
+
+list_comp_6_month = list_comp_6_month.withColumn("avg_reb1", when(list_comp_6_month.avg_reb1 < 0.0, 0.0).otherwise(list_comp_6_month.avg_reb1))
+list_comp_6_month = list_comp_6_month.withColumn("avg_frght1", when(list_comp_6_month.avg_frght1 < 0.0, 0.0).otherwise(list_comp_6_month.avg_frght1))
+list_comp_6_month = list_comp_6_month.withColumn("avg_com1", when(list_comp_6_month.avg_com1 < 0.0, 0.0).otherwise(list_comp_6_month.avg_com1))
+
+list_comp_6_month.groupBy("avg_reb1").count().show()
+
+
+list_comp_6_month = list_comp_6_month.selectExpr('cust_number', 'cxp_region as cust_region', 'sales_org', 'avg_reb1', 'avg_frght1', 'avg_com1')
+
+list_comp_6_month.show(3)
+
+list_comp_all = list_complete.alias("list_comp_all")
+
+
+list_comp_all = list_comp_all.withColumn("total_reb", list_comp_all.reb_kg_eur * list_comp_all.transactional_vol_kg)
+list_comp_all = list_comp_all.withColumn("total_frght", list_comp_all.frght_kg_eur * list_comp_all.transactional_vol_kg)
+list_comp_all = list_comp_all.withColumn("total_com", list_comp_all.othvse_kg_eur * list_comp_all.transactional_vol_kg)
+
+list_comp_all = list_comp_all.groupBy('cust_number', 'cxp_region', 'sales_org').agg(sum("total_reb").alias("sum_total_reb"), sum("total_frght").alias("sum_total_frght"), sum("total_com").alias("sum_total_com"), sum("transactional_vol_kg").alias("sum_total_vol"))
+
+list_comp_all.groupBy("sum_total_reb").count().show()
+
+list_comp_all = list_comp_all.withColumn("avg_reb2", round((list_comp_all.sum_total_reb / list_comp_all.sum_total_vol), 2))
+list_comp_all = list_comp_all.withColumn("avg_frght2", round((list_comp_all.sum_total_frght / list_comp_all.sum_total_vol), 2))
+list_comp_all = list_comp_all.withColumn("avg_com2", round((list_comp_all.sum_total_com / list_comp_all.sum_total_vol), 2))
+
+list_comp_all = list_comp_all.withColumn("avg_reb2", when(list_comp_all.avg_reb2 < 0.0, 0.0).otherwise(list_comp_all.avg_reb2))
+list_comp_all = list_comp_all.withColumn("avg_frght2", when(list_comp_all.avg_frght2 < 0.0, 0.0).otherwise(list_comp_all.avg_frght2))
+list_comp_all = list_comp_all.withColumn("avg_com2", when(list_comp_all.avg_com2 < 0.0, 0.0).otherwise(list_comp_all.avg_com2))
+
+list_comp_all.groupBy("avg_reb2").count().show()
+
+
+list_comp_all = list_comp_all.selectExpr('cust_number', 'cxp_region as cust_region', 'sales_org', 'avg_reb2', 'avg_frght2', 'avg_com2')
+
+
+cust_details = cust_details.join(broadcast(list_comp_6_month), ["cust_number", "cust_region", "sales_org"] ,'left')
+cust_details = cust_details.join(broadcast(list_comp_all), ["cust_number", "cust_region", "sales_org"] ,'left')
+
+print("\n \n 2 \n")
+print(cust_details.count())
+
+cust_details.groupBy("avg_reb1").count().show()
+
+
+cust_details = cust_details.withColumn('average_frght_kg_eur', when((isnan(cust_details.avg_frght1) | cust_details.avg_frght1.isNull()), cust_details.avg_frght2).otherwise(cust_details.avg_frght1)) 
+cust_details = cust_details.withColumn('average_reb_eur', when((isnan(cust_details.avg_reb1) | cust_details.avg_reb1.isNull()), cust_details.avg_reb2).otherwise(cust_details.avg_reb1)) 
+cust_details = cust_details.withColumn('average_com_kg_eur', when((isnan(cust_details.avg_com1) | cust_details.avg_com1.isNull()), cust_details.avg_com2).otherwise(cust_details.avg_com1)) 
+
+cust_details = cust_details.fillna(0.0, subset=['average_frght_kg_eur', 'average_frght_kg_eur', 'average_com_kg_eur'])
+
+
+cust_details = cust_details.join(broadcast(price_master), ["cust_number", "sales_org"] ,'left')
+cust_details = cust_details.join(broadcast(price_master2), ["cust_number"] ,'left')
+
+print("\n \n 3 \n")
+print(cust_details.count())
+
+cust_details.select("cust_number", "sales_org", "base_unit").show()
+
+cust_details = cust_details.withColumn('base_unit', when((isnan(cust_details.base_unit1) | cust_details.base_unit1.isNull()), cust_details.base_unit2).otherwise(cust_details.base_unit1)) 
+
+
+
+cust_details = cust_details.withColumn('upload_date', current_timestamp())
+cust_details = cust_details.withColumn('source_system', lit("customer_details_mendix"))
+
+cust_details = cust_details.fillna("missing in SAP", subset=['cust_payment_term'])
+
+
+cust_details = cust_details.drop('condition_type')
+cust_details = cust_details.join(cxp_cond_type, ["cust_number"] ,'left')
+cust_details = cust_details.join(cxp_cond_type2, ["cust_number"] ,'left')
+
+cust_details = cust_details.withColumn('condition_type', when(((isnan(cust_details.condition_type1)) | cust_details.condition_type1.isNull()), cust_details.condition_type2).otherwise(cust_details.condition_type1)) 
+
+cust_details = cust_details.drop('condition_type1', 'condition_type2')
+
+cust_details = cust_details.fillna("YP00", subset=['condition_type'])
+
+
+cust_details = cust_details.select("cust_grp_adj_id", "cust_grp_adj", "cust_size",	"cust_number", "cust_descrp", \
+"cust_descrp_chi", "country_soldto", "country_grp", "cust_classification", "account_mgr", "ibg",  "cust_region",	"order_cost_eur", "cust_payment_term",	"base_currency", "base_unit",\
+"condition_type", "order_cost_base_currency", "sales_org", "sales_off", "sales_off_descrp",	\
+"sales_off_email",	"incoterm1", "incoterm2", "average_reb_kg_eur", "average_frght_kg_eur", "average_com_kg_eur", "upload_date", "source_system")
+
+
+cust_details.show()
+
+cust_details = cust_details.repartition(1)
+cust_details_df = DynamicFrame.fromDF(cust_details, glueContext,"cust_details_df" )
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = cust_details_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/analytical_layer/al_3_2_5_customer_details_mendix"}, format = "parquet", transformation_ctx = "datasink4")
+
+job.commit()

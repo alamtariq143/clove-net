@@ -1,0 +1,77 @@
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+from datetime import datetime
+
+s3_client = boto3.client('s3')
+BUCKET = 'cap-qa-data-lake'
+
+PREFIX = 'pricing-app/processed/normalization_layer/ds_2_6_12_1_Competitiveness_Factor/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+      
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+
+competitive_position_chemistry  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_9_mapping_competitive_position_chemistry", transformation_ctx = "datasource0")
+competitive_position_geography  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_10_mapping_competitive_position_geography", transformation_ctx = "datasource0")
+competitiveness_adjustment_factor_chemistry  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_11_mapping_competitiveness_adjustment_factor_chemistry", transformation_ctx = "datasource1")
+competitiveness_adjustment_factor_geography  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_6_12_mapping_competitiveness_adjustment_factor_geography", transformation_ctx = "datasource2")
+
+competitive_position_chemistry = competitive_position_chemistry.toDF().selectExpr("ms_new","chemistry","competitive_position_chemistry")
+competitive_position_geography = competitive_position_geography.toDF().selectExpr("ms_new", "region_ship_to as region", "competitive_position_geography")
+competitiveness_adjustment_factor_chemistry = competitiveness_adjustment_factor_chemistry.toDF().selectExpr("competitive_position_chemistry","adjustment_factor_chemistry")
+competitiveness_adjustment_factor_geography = competitiveness_adjustment_factor_geography.toDF().selectExpr("competitive_position_geography","adjustment_factor_geography")
+
+competitive_position_chemistry = competitive_position_chemistry.join(broadcast(competitive_position_geography), "ms_new" ,'left')
+competitive_position_chemistry = competitive_position_chemistry.join(broadcast(competitiveness_adjustment_factor_chemistry), "competitive_position_chemistry" ,'left')
+competitive_position_chemistry = competitive_position_chemistry.join(broadcast(competitiveness_adjustment_factor_geography), "competitive_position_geography" ,'left')
+
+competitive_position_chemistry = competitive_position_chemistry.selectExpr("ms_new", "chemistry", "competitive_position_chemistry", "adjustment_factor_chemistry", "region", "competitive_position_geography", "adjustment_factor_geography")
+
+competitive_position_chemistry = competitive_position_chemistry.withColumn('upload_date', current_timestamp())
+competitive_position_chemistry = competitive_position_chemistry.withColumn('source_system', lit("Competitiveness factor"))
+
+competitive_position_chemistry = competitive_position_chemistry.selectExpr("ms_new", "chemistry", "competitive_position_chemistry", \
+"adjustment_factor_chemistry", "region", "competitive_position_geography", "adjustment_factor_geography", \
+"upload_date", "source_system")
+
+competitive_position_chemistry = competitive_position_chemistry.repartition(1)
+
+competitive_factor_df = DynamicFrame.fromDF(competitive_position_chemistry, glueContext,"competitive_factor_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = competitive_factor_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/normalization_layer/ds_2_6_12_1_Competitiveness_Factor"}, format = "parquet", transformation_ctx = "datasink4")
+
+job.commit()
+
+
+
+
+
+
+

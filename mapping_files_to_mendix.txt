@@ -1,0 +1,681 @@
+import sys
+import boto3
+import pandas
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql import SparkSession
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import Row
+from pyspark.ml.linalg import Vectors
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit
+from pyspark.sql.functions import to_timestamp
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "4000").getOrCreate()
+#spark =  spark.conf.set("spark.sql.broadcastTimeout", "400")
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+s3_client = boto3.client('s3')
+
+BUCKET = 'cap-qa-data-lake'
+
+#1.4.1
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_1_Mapping_volume_index_bracket/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+vol_index_brkt  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_1_mapping_volume_index_bracket", transformation_ctx = "datasource0")
+vol_index_brkt = vol_index_brkt.toDF()
+vol_index_brkt = vol_index_brkt.repartition(1)
+vol_index_brkt_df = DynamicFrame.fromDF(vol_index_brkt, glueContext,"vol_index_brkt_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = vol_index_brkt_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_1_Mapping_volume_index_bracket"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.2
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_2_Mapping_volume_index/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+vol_index  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_2_mapping_volume_index", transformation_ctx = "datasource0")
+vol_index = vol_index.toDF()
+vol_index = vol_index.withColumnRenamed("prod.hier.3", "pline")
+vol_index = vol_index.selectExpr("pline", "volume_index", "upload_date", "source_system")
+vol_index = vol_index.repartition(1)
+vol_index_df = DynamicFrame.fromDF(vol_index, glueContext,"vol_index_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = vol_index_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_2_Mapping_volume_index"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.3
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_3_mapping_thresholds_ml2/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+threshold_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_3_mapping_thresholds_ml2", transformation_ctx = "datasource0")
+threshold_ml2 = threshold_ml2.toDF()
+threshold_ml2 = threshold_ml2.repartition(1)
+threshold_ml2_df = DynamicFrame.fromDF(threshold_ml2, glueContext,"threshold_ml2_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = threshold_ml2_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_3_mapping_thresholds_ml2"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.4
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_4_mapping_low_cm_cutoff/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+low_cm_cutoff  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_4_mapping_low_cm_cutoff", transformation_ctx = "datasource0")
+low_cm_cutoff = low_cm_cutoff.toDF()
+low_cm_cutoff = low_cm_cutoff.repartition(1)
+low_cm_cutoff_df = DynamicFrame.fromDF(low_cm_cutoff, glueContext,"low_cm_cutoff_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = low_cm_cutoff_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_4_mapping_low_cm_cutoff"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.5
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_5_mapping_payment_terms_fee/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+payment_terms_fee  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_5_mapping_payment_terms_fee", transformation_ctx = "datasource0")
+payment_terms_fee = payment_terms_fee.toDF()
+payment_terms_fee = payment_terms_fee.withColumnRenamed("cpmt", "payment_term")
+payment_terms_fee = payment_terms_fee.withColumnRenamed("own_explanation", "explanation")
+payment_terms_fee = payment_terms_fee.withColumnRenamed("premium_percent", "premium_percentage")
+#payment_terms_fee = payment_terms_fee.selectExpr("payment_term", "explanation", "premium_percentage", "upload_date", "source_system")
+payment_terms_fee = payment_terms_fee.repartition(1)
+payment_terms_fee_df = DynamicFrame.fromDF(payment_terms_fee, glueContext,"payment_terms_fee_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = payment_terms_fee_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_5_mapping_payment_terms_fee"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.6
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_6_mapping_region_country_group/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+region_country_group  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_6_mapping_region_country_group", transformation_ctx = "datasource0")
+region_country_group = region_country_group.toDF()
+region_country_group = region_country_group.repartition(1)
+region_country_group_df = DynamicFrame.fromDF(region_country_group, glueContext,"region_country_group_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = region_country_group_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_6_mapping_region_country_group"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.7
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_7_mapping_new_product_positioning/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+new_product_positioning  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_7_mapping_new_product_positioning", transformation_ctx = "datasource0")
+new_product_positioning = new_product_positioning.toDF()
+new_product_positioning = new_product_positioning.repartition(1)
+new_product_positioning_df = DynamicFrame.fromDF(new_product_positioning, glueContext,"new_product_positioning_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = new_product_positioning_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_7_mapping_new_product_positioning"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.8
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_8_mapping_missing_product_ml2/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+missing_product_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_8_mapping_missing_product_ml2", transformation_ctx = "datasource0")
+missing_product_ml2 = missing_product_ml2.toDF()
+missing_product_ml2 = missing_product_ml2.repartition(1)
+missing_product_ml2_df = DynamicFrame.fromDF(missing_product_ml2, glueContext,"missing_product_ml2_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = missing_product_ml2_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_8_mapping_missing_product_ml2"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.9
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_9_mapping_competitive_position_chemistry/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+competitive_position_chemistry  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_9_mapping_competitive_position_chemistry", transformation_ctx = "datasource0")
+competitive_position_chemistry = competitive_position_chemistry.toDF()
+competitive_position_chemistry = competitive_position_chemistry.repartition(1)
+competitive_position_chemistry_df = DynamicFrame.fromDF(competitive_position_chemistry, glueContext,"competitive_position_chemistry_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = competitive_position_chemistry_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_9_mapping_competitive_position_chemistry"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.10
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_10_mapping_competitive_position_geography/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+competitive_position_geography  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_10_mapping_competitive_position_geography", transformation_ctx = "datasource0")
+competitive_position_geography = competitive_position_geography.toDF()
+competitive_position_geography = competitive_position_geography.repartition(1)
+competitive_position_geography_df = DynamicFrame.fromDF(competitive_position_geography, glueContext,"competitive_position_geography_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = competitive_position_geography_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_10_mapping_competitive_position_geography"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.11
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_11_mapping_competitiveness_adjustment_factor_chemistry/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+competitiveness_adjustment_factor_chemistry  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_11_mapping_competitiveness_adjustment_factor_chemistry", transformation_ctx = "datasource0")
+competitiveness_adjustment_factor_chemistry = competitiveness_adjustment_factor_chemistry.toDF()
+competitiveness_adjustment_factor_chemistry = competitiveness_adjustment_factor_chemistry.repartition(1)
+competitiveness_adjustment_factor_chemistry_df = DynamicFrame.fromDF(competitiveness_adjustment_factor_chemistry, glueContext,"competitiveness_adjustment_factor_chemistry_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = competitiveness_adjustment_factor_chemistry_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_11_mapping_competitiveness_adjustment_factor_chemistry"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.12
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_12_mapping_competitiveness_adjustment_factor_geography/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+competitiveness_adjustment_factor_geography  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_12_mapping_competitiveness_adjustment_factor_geography", transformation_ctx = "datasource0")
+competitiveness_adjustment_factor_geography = competitiveness_adjustment_factor_geography.toDF()
+competitiveness_adjustment_factor_geography = competitiveness_adjustment_factor_geography.repartition(1)
+competitiveness_adjustment_factor_geography_df = DynamicFrame.fromDF(competitiveness_adjustment_factor_geography, glueContext,"competitiveness_adjustment_factor_geography_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = competitiveness_adjustment_factor_geography_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_12_mapping_competitiveness_adjustment_factor_geography"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.2.13
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_13_mapping_order_cost/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+order_cost  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_13_mapping_order_cost", transformation_ctx = "datasource0")
+order_cost = order_cost.toDF()
+order_cost.show()
+order_cost = order_cost.withColumnRenamed("region_ship_to", "Region").withColumnRenamed("currency", "Currency").withColumnRenamed("charge", "Charge")
+order_cost = order_cost.repartition(1)
+order_cost_df = DynamicFrame.fromDF(order_cost, glueContext,"order_cost_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = order_cost_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_13_mapping_order_cost"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.14
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_14_mapping_accountmanager_input/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+accountmanager_input  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_14_mapping_accountmanager_input", transformation_ctx = "datasource0")
+accountmanager_input = accountmanager_input.toDF()
+accountmanager_input = accountmanager_input.repartition(1)
+accountmanager_input = accountmanager_input.withColumn('customer', lpad(col('customer').cast('int').cast('string'), 10, '0'))
+accountmanager_input_df = DynamicFrame.fromDF(accountmanager_input, glueContext,"accountmanager_input_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = accountmanager_input_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_14_mapping_accountmanager_input"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.15
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_15_mapping_market_segments/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+vol_index_brkt  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_15_mapping_market_segments", transformation_ctx = "datasource0")
+vol_index_brkt = vol_index_brkt.toDF()
+vol_index_brkt = vol_index_brkt.repartition(1)
+vol_index_brkt_df = DynamicFrame.fromDF(vol_index_brkt, glueContext,"vol_market_segments" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = vol_index_brkt_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_15_mapping_market_segments"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.16
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_16_mapping_ph3_prod_type_chemistry/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+ph3_prod_type_chemistry  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_16_mapping_ph3_prod_type_chemistry", transformation_ctx = "datasource0")
+ph3_prod_type_chemistry = ph3_prod_type_chemistry.toDF()
+ph3_prod_type_chemistry = ph3_prod_type_chemistry.repartition(1)
+ph3_prod_type_chemistry_df = DynamicFrame.fromDF(ph3_prod_type_chemistry, glueContext,"ph3_prod_type_chemistry_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = ph3_prod_type_chemistry_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_16_mapping_ph3_prod_type_chemistry"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.18
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_18_mapping_plant_details/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+plant_details  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_18_mapping_plant_details", transformation_ctx = "datasource0")
+plant_details = plant_details.toDF()
+plant_details = plant_details.repartition(1)
+plant_details_df = DynamicFrame.fromDF(plant_details, glueContext,"plant_details_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = plant_details_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_18_mapping_plant_details"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.19
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_19_Mapping_Portfolio_strategic_overwrite_opportunities/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+fx_rate = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "ds_2_5_4_3_mapping_fx_rate", transformation_ctx = "datasource15")
+fx_rate = fx_rate.toDF().selectExpr('from_currency', 'to_currency', 'exchange_rate')
+fx_rate = fx_rate.filter((fx_rate.from_currency != 'EUR') & (fx_rate.to_currency == 'EUR'))
+
+t006 = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_sap_p1p_t006", transformation_ctx = "datasource8")
+t006 = t006.toDF().selectExpr("msehi as uom", "zaehl", "nennr", "exp10", "dimid")
+t006 = t006.filter(t006.dimid == 'MASS')
+t006 = t006.withColumn("weight_rate_to_apply", (t006.zaehl/t006.nennr) * pow(10, t006.exp10))
+t006 = t006.select("uom", "weight_rate_to_apply")
+
+strategic_overwrite = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_19_Mapping_Portfolio_strategic_overwrite_opportunities", transformation_ctx = "datasource0")
+strategic_overwrite = strategic_overwrite.toDF()
+
+strategic_overwrite = strategic_overwrite.withColumn('customer_soldto_number', strategic_overwrite.customer_soldto_number.cast(LongType()))
+strategic_overwrite = strategic_overwrite.withColumn('customer_soldto_number', lpad(strategic_overwrite.customer_soldto_number.cast(StringType()), 10, '0'))
+print('strategic overwrite test')
+print(strategic_overwrite.count())
+
+# nbr_price: kg_eur or base
+strategic_overwrite = strategic_overwrite.join(broadcast(fx_rate), [strategic_overwrite.base_currency == fx_rate.from_currency], 'left')
+print(strategic_overwrite.count())
+strategic_overwrite = strategic_overwrite.join(broadcast(t006), [strategic_overwrite.base_unit == t006.uom], 'left')
+print(strategic_overwrite.count())
+
+strategic_overwrite = strategic_overwrite.withColumn('nbr_price', when(isnan(strategic_overwrite.nbr_price_kg_eur), strategic_overwrite.nbr_price_base * (strategic_overwrite.exchange_rate * strategic_overwrite.weight_rate_to_apply)).otherwise(strategic_overwrite.nbr_price_kg_eur))
+strategic_overwrite.groupBy('nbr_price').count().show()
+strategic_overwrite = strategic_overwrite.withColumn('nbr_price_kg_eur', strategic_overwrite.nbr_price)
+print(strategic_overwrite.count())
+strategic_overwrite.groupBy('nbr_price_kg_eur').count().show()
+strategic_overwrite = strategic_overwrite.drop('from_currency','to_currency', 'exchange_rate',"uom", "weight_rate_to_apply","nbr_price") # everything dropped? 
+strategic_overwrite.show(5)
+
+#calculations
+strategic_overwrite = strategic_overwrite.withColumn('nbr_costs_kg_eur', strategic_overwrite.suggested_costs)
+strategic_overwrite = strategic_overwrite.withColumn('nbr_cm_kg_eur', strategic_overwrite.nbr_price_kg_eur - strategic_overwrite.nbr_costs_kg_eur)
+strategic_overwrite = strategic_overwrite.withColumn('suggested_price_kg_eur', strategic_overwrite.nbr_price_kg_eur)
+strategic_overwrite = strategic_overwrite.withColumn('suggested_cm_kg_eur', strategic_overwrite.nbr_cm_kg_eur)
+
+strategic_overwrite = strategic_overwrite.repartition(1)
+strategic_overwrite_df = DynamicFrame.fromDF(strategic_overwrite, glueContext,"strategic_overwrite_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = strategic_overwrite_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_19_Mapping_Portfolio_strategic_overwrite_opportunities"}, format = "parquet", transformation_ctx = "datasink4")
+print('strategic overwrite finished')
+
+#1.4.20 - base
+# PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_20_Mapping_portfolio_strategic_overwrite_cxp_without_sales/'
+# response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+# if 'Contents' in response.keys():
+#     for object in response['Contents']:
+#         print('Deleting', object['Key'])
+#         s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+# strategic_overwrite_cxp = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_20_Mapping_portfolio_strategic_overwrite_cxp_without_sales", transformation_ctx = "datasource0")
+# strategic_overwrite_cxp = strategic_overwrite_cxp.toDF()
+
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('customer_soldto_number', strategic_overwrite_cxp.customer_soldto_number.cast(LongType()))
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('customer_soldto_number', lpad(strategic_overwrite_cxp.customer_soldto_number.cast(StringType()), 10, '0'))
+# print('strategic overwrite cxp  test')
+# print(strategic_overwrite_cxp.count())
+
+# # nbr_price: kg_eur or base
+# strategic_overwrite_cxp = strategic_overwrite_cxp.join(broadcast(fx_rate), [strategic_overwrite_cxp.base_currency == fx_rate.from_currency], 'left')
+# strategic_overwrite_cxp = strategic_overwrite_cxp.join(broadcast(t006), [strategic_overwrite_cxp.base_unit == t006.uom], 'left')
+
+# # strategic_overwrite_cxp.groupBy('nbr_price_base').count().show()
+# # strategic_overwrite_cxp.groupBy('nbr_price_kg_eur').count().show()
+
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_price', when(isnan(strategic_overwrite_cxp.nbr_price_base), strategic_overwrite_cxp.nbr_price_kg_eur / (strategic_overwrite_cxp.exchange_rate * strategic_overwrite_cxp.weight_rate_to_apply)).otherwise(strategic_overwrite_cxp.nbr_price_base))
+# strategic_overwrite_cxp.groupBy('nbr_price').count().show()
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_price_base', strategic_overwrite_cxp.nbr_price)
+# print(strategic_overwrite_cxp.count())
+# strategic_overwrite_cxp.groupBy('nbr_price_base').count().show()
+# #strategic_overwrite_cxp = strategic_overwrite_cxp.drop('from_currency','to_currency', 'exchange_rate',"uom", "weight_rate_to_apply","nbr_price") # everything dropped? 
+
+# #calculations
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_costs_base', strategic_overwrite_cxp.suggested_costs_base)
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_cm_base', strategic_overwrite_cxp.nbr_price_base - strategic_overwrite_cxp.nbr_costs_base)
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('suggested_price_base', strategic_overwrite_cxp.nbr_price_base)
+# strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('suggested_cm_base', strategic_overwrite_cxp.nbr_cm_base)
+# print(strategic_overwrite_cxp.count())
+# strategic_overwrite_cxp.show(5)
+# strategic_overwrite_cxp.filter(strategic_overwrite_cxp.unique_id == 18625).show()
+# strategic_overwrite_cxp.filter(strategic_overwrite_cxp.unique_id == 30087).show()
+# strategic_overwrite_cxp.filter(strategic_overwrite_cxp.unique_id == 44510).show()
+
+# strategic_overwrite_cxp = strategic_overwrite_cxp.repartition(1)
+# strategic_overwrite_cxp_df = DynamicFrame.fromDF(strategic_overwrite_cxp, glueContext,"strategic_overwrite_cxp_df" )
+
+# datasink4 = glueContext.write_dynamic_frame.from_options(frame = strategic_overwrite_cxp_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_20_Mapping_portfolio_strategic_overwrite_cxp_without_sales"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.20 - kg eur
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_20_Mapping_portfolio_strategic_overwrite_cxp_without_sales/'
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+strategic_overwrite_cxp = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_20_Mapping_portfolio_strategic_overwrite_cxp_without_sales", transformation_ctx = "datasource0")
+strategic_overwrite_cxp = strategic_overwrite_cxp.toDF()
+
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('customer_soldto_number', strategic_overwrite_cxp.customer_soldto_number.cast(LongType()))
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('customer_soldto_number', lpad(strategic_overwrite_cxp.customer_soldto_number.cast(StringType()), 10, '0'))
+print('strategic overwrite cxp  test')
+print(strategic_overwrite_cxp.count())
+
+# nbr_price: kg_eur or base
+strategic_overwrite_cxp = strategic_overwrite_cxp.join(broadcast(fx_rate), [strategic_overwrite_cxp.base_currency == fx_rate.from_currency], 'left')
+strategic_overwrite_cxp = strategic_overwrite_cxp.join(broadcast(t006), [strategic_overwrite_cxp.base_unit == t006.uom], 'left')
+
+# strategic_overwrite_cxp.groupBy('nbr_price_base').count().show()
+# strategic_overwrite_cxp.groupBy('nbr_price_kg_eur').count().show()
+
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_price', when(isnan(strategic_overwrite_cxp.nbr_price_kg_eur), strategic_overwrite_cxp.nbr_price_base * (strategic_overwrite_cxp.exchange_rate * strategic_overwrite_cxp.weight_rate_to_apply)).otherwise(strategic_overwrite_cxp.nbr_price_kg_eur))
+strategic_overwrite_cxp.groupBy('nbr_price').count().show()
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_price_kg_eur', strategic_overwrite_cxp.nbr_price)
+print(strategic_overwrite_cxp.count())
+strategic_overwrite_cxp.groupBy('nbr_price_kg_eur').count().show()
+#strategic_overwrite_cxp = strategic_overwrite_cxp.drop('from_currency','to_currency', 'exchange_rate',"uom", "weight_rate_to_apply","nbr_price") # everything dropped? 
+
+#calculations
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_costs_kg_eur', strategic_overwrite_cxp.suggested_costs)
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('nbr_cm_kg_eur', strategic_overwrite_cxp.nbr_price_kg_eur - strategic_overwrite_cxp.nbr_costs_kg_eur)
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('suggested_price_kg_eur', strategic_overwrite_cxp.nbr_price_kg_eur)
+strategic_overwrite_cxp = strategic_overwrite_cxp.withColumn('suggested_cm_kg_eur', strategic_overwrite_cxp.nbr_cm_kg_eur)
+print(strategic_overwrite_cxp.count())
+strategic_overwrite_cxp.show(5)
+strategic_overwrite_cxp.filter(strategic_overwrite_cxp.unique_id == 18625).show()
+strategic_overwrite_cxp.filter(strategic_overwrite_cxp.unique_id == 30087).show()
+strategic_overwrite_cxp.filter(strategic_overwrite_cxp.unique_id == 44510).show()
+
+strategic_overwrite_cxp = strategic_overwrite_cxp.repartition(1)
+strategic_overwrite_cxp_df = DynamicFrame.fromDF(strategic_overwrite_cxp, glueContext,"strategic_overwrite_cxp_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = strategic_overwrite_cxp_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_20_Mapping_portfolio_strategic_overwrite_cxp_without_sales"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+#1.4.18
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_20_mapping_portfolio_strategic_overwrite_distribution_list/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+strat_overwrite_dist_list  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_20_mapping_portfolio_strategic_overwrite_distribution_list", transformation_ctx = "datasource0")
+strat_overwrite_dist_list = strat_overwrite_dist_list.toDF()
+strat_overwrite_dist_list = strat_overwrite_dist_list.repartition(1)
+strat_overwrite_dist_list_df = DynamicFrame.fromDF(strat_overwrite_dist_list, glueContext,"strat_overwrite_dist_list_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = strat_overwrite_dist_list_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_20_mapping_portfolio_strategic_overwrite_distribution_list"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+
+#1.4.21
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_21_mapping_forward_looking_rmc/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+forward_looking_rmc  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_21_mapping_forward_looking_rmc", transformation_ctx = "datasource0")
+forward_looking_rmc = forward_looking_rmc.toDF()
+
+#forward_looking_rmc = forward_looking_rmc.withColumnRenamed("rmc__manual__-_shipto_emea", "rmc_manual_shipto_emea").withColumnRenamed("rmc__manual__-_shipto_latam", "rmc_manual_shipto_latam").withColumnRenamed("rmc__manual__-_shipto_apac", "rmc_manual_shipto_apac").withColumnRenamed("rmc__manual__-_shipto_na", "rmc_manual_shipto_na")
+forward_looking_rmc = forward_looking_rmc.repartition(1)
+forward_looking_rmc_df = DynamicFrame.fromDF(forward_looking_rmc, glueContext,"forward_looking_rmc_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = forward_looking_rmc_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_21_mapping_forward_looking_rmc"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.22
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_22_mapping_sales_officers_cwid_to_email/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+vol_index_brkt  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_22_mapping_sales_officers_cwid_to_email", transformation_ctx = "datasource0")
+vol_index_brkt = vol_index_brkt.toDF()
+vol_index_brkt = vol_index_brkt.repartition(1)
+vol_index_brkt_df = DynamicFrame.fromDF(vol_index_brkt, glueContext,"mapping_sales_officers_cwid_to_email" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = vol_index_brkt_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_22_mapping_sales_officers_cwid_to_email"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.23
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_23_mapping_customers_to_customer_group_and_ml2/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+customers_to_customer_group_and_ml2  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_23_mapping_customers_to_customer_group_and_ml2", transformation_ctx = "datasource0")
+customers_to_customer_group_and_ml2 = customers_to_customer_group_and_ml2.toDF()
+print(customers_to_customer_group_and_ml2.columns)
+customers_to_customer_group_and_ml2 = customers_to_customer_group_and_ml2.withColumn('customer_sold_to', customers_to_customer_group_and_ml2.customer_sold_to.cast(LongType()))
+customers_to_customer_group_and_ml2.select('customer_sold_to').show()
+customers_to_customer_group_and_ml2 = customers_to_customer_group_and_ml2.withColumn('customer_sold_to', lpad(customers_to_customer_group_and_ml2.customer_sold_to.cast(StringType()), 10, '0'))
+customers_to_customer_group_and_ml2.select('customer_sold_to').show()
+
+customers_to_customer_group_and_ml2 = customers_to_customer_group_and_ml2.repartition(1)
+customers_to_customer_group_and_ml2_df = DynamicFrame.fromDF(customers_to_customer_group_and_ml2, glueContext,"customers_to_customer_group_and_ml2_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = customers_to_customer_group_and_ml2_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_23_mapping_customers_to_customer_group_and_ml2"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.24
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_24_mapping_thresholds_salesorg/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+thresholds_salesorg  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_24_mapping_thresholds_salesorg", transformation_ctx = "datasource0")
+thresholds_salesorg = thresholds_salesorg.toDF()
+thresholds_salesorg = thresholds_salesorg.repartition(1)
+thresholds_salesorg_df = DynamicFrame.fromDF(thresholds_salesorg, glueContext,"thresholds_salesorg_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = thresholds_salesorg_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_24_mapping_thresholds_salesorg"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.25
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_25_mapping_ml2_cxp_without_sales/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+ml2_cxp  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_25_mapping_ml2_cxp_without_sales", transformation_ctx = "datasource0")
+ml2_cxp = ml2_cxp.toDF()
+ml2_cxp = ml2_cxp.withColumn('pfam', lpad(ml2_cxp.pfam.cast(StringType()), 3, '0'))
+
+ml2_cxp = ml2_cxp.repartition(1)
+ml2_cxp_df = DynamicFrame.fromDF(ml2_cxp, glueContext,"ml2_cxp_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = ml2_cxp_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_25_mapping_ml2_cxp_without_sales"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+#1.4.27
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_27_mapping_ml2_cxp_without_sales_ph3/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+ml2_cxp_pfam  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_27_mapping_ml2_cxp_without_sales_ph3", transformation_ctx = "datasource0")
+ml2_cxp_pfam = ml2_cxp_pfam.toDF()
+ml2_cxp_pfam = ml2_cxp_pfam.withColumn('pfam', lpad(ml2_cxp_pfam.pfam.cast(StringType()), 3, '0'))
+
+ml2_cxp_pfam = ml2_cxp_pfam.repartition(1)
+ml2_cxp_pfam_df = DynamicFrame.fromDF(ml2_cxp_pfam, glueContext,"ml2_cxp_df" )
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = ml2_cxp_pfam_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_27_mapping_ml2_cxp_without_sales_ph3"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+#1.4.28
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_28_mapping_ml2_cxp_without_sales_cust/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+ml2_cxp_cust  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_28_mapping_ml2_cxp_without_sales_cust", transformation_ctx = "datasource0")
+ml2_cxp_cust = ml2_cxp_cust.toDF()
+ml2_cxp_cust = ml2_cxp_cust.withColumn("cust_number", lpad(ml2_cxp_cust.cust_number.cast(StringType()), 10, '0'))
+
+ml2_cxp_cust = ml2_cxp_cust.repartition(1)
+ml2_cxp_cust_df = DynamicFrame.fromDF(ml2_cxp_cust, glueContext,"ml2_cxp_df")
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = ml2_cxp_cust_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_28_mapping_ml2_cxp_without_sales_cust"}, format = "parquet", transformation_ctx = "datasink4")
+
+#1.4.25
+PREFIX = 'pricing-app/processed/mapping_files/ds_2_6_26_mapping_weekly_file_distribution_list/'
+
+response = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX)
+
+if 'Contents' in response.keys():
+    for object in response['Contents']:
+        print('Deleting', object['Key'])
+        s3_client.delete_object(Bucket=BUCKET, Key=object['Key'])
+        
+
+weekly_dist  = glueContext.create_dynamic_frame.from_catalog(database = "rfm_insights", table_name= "in_1_4_26_mapping_weekly_file_distribution_list", transformation_ctx = "datasource0")
+weekly_dist = weekly_dist.toDF()
+
+weekly_dist = weekly_dist.repartition(1)
+weekly_dist_df = DynamicFrame.fromDF(weekly_dist, glueContext,"ml2_cxp_df")
+
+datasink4 = glueContext.write_dynamic_frame.from_options(frame = weekly_dist_df, connection_type = "s3", connection_options = {"path": "s3://cap-qa-data-lake/pricing-app/processed/mapping_files/ds_2_6_26_mapping_weekly_file_distribution_list"}, format = "parquet", transformation_ctx = "datasink4")
+
+
+
+job.commit()
+
+
+
